@@ -409,3 +409,227 @@ def plot_charges_vs_pH(pKa, acid_base, pH_range=(2, 12), save_path=None):
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f'  Saved: {save_path}')
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive single-screen summary (static PNG)
+# ---------------------------------------------------------------------------
+
+def plot_summary(loss_history, score_history, param_history,
+                 all_schedules, target_idx,
+                 equil_traj, schedule_trajs, pH_schedule,
+                 equil_duration, duration_per_seg,
+                 static, trained_params,
+                 final_scores,
+                 save_path='summary.png'):
+    """
+    Six-panel summary figure saved as a single PNG.
+
+    Panels
+    ------
+    (0,0) Training loss vs epoch
+    (0,1) pKa values vs epoch (one line per species)
+    (0,2) φ and J vs epoch
+    (1,0:2) Concentration time series for target schedule
+            (includes pH-7 pre-equilibration + schedule segments)
+            Black dashed line = total monomer content M(t) — should stay = 1
+    (1,2)  Free energy ΔG_{ij}(pH) for all pairs, trained parameters
+    (2,0:3) Bar chart: correct-bond fraction under all schedule permutations
+    """
+    from .dynamics import make_triu_indices
+    from .training import total_monomer_content
+
+    n               = static['n']
+    i_idx, j_idx    = static['i_idx'], static['j_idx']
+    correct_mask_np = static['correct_mask_np']
+    acid_base       = np.array(static['acid_base'])
+    pKa             = np.array(trained_params['pKa'])
+    phi             = float(trained_params['phi'])
+    J               = float(trained_params['J'])
+
+    fig = plt.figure(figsize=(18, 14))
+    gs  = fig.add_gridspec(3, 3, hspace=0.48, wspace=0.35)
+
+    ax_loss = fig.add_subplot(gs[0, 0])
+    ax_pka  = fig.add_subplot(gs[0, 1])
+    ax_phiJ = fig.add_subplot(gs[0, 2])
+    ax_conc = fig.add_subplot(gs[1, 0:2])
+    ax_dG   = fig.add_subplot(gs[1, 2])
+    ax_bar  = fig.add_subplot(gs[2, 0:3])
+
+    epochs     = np.arange(len(loss_history))
+    score_arr  = np.array(score_history)    # (n_epochs, n_schedules)
+    pKa_hist   = np.array([p['pKa'] for p in param_history])  # (n_epochs, n)
+    phi_hist   = np.array([p['phi'] for p in param_history])
+    J_hist     = np.array([p['J']   for p in param_history])
+
+    # -------------------------------------------------------------------
+    # Panel 1: Loss
+    # -------------------------------------------------------------------
+    ax_loss.plot(epochs, loss_history, 'k-', linewidth=2)
+    ax_loss.set_xlabel('Epoch', fontsize=11)
+    ax_loss.set_ylabel('Loss  (−log p_target)', fontsize=10)
+    ax_loss.set_title('Training Loss', fontsize=12)
+    ax_loss.grid(alpha=0.25)
+
+    # -------------------------------------------------------------------
+    # Panel 2: pKa evolution
+    # -------------------------------------------------------------------
+    colors_n = plt.cm.tab10(np.linspace(0, 0.9, n))
+    for i in range(n):
+        ab  = 'base' if acid_base[i] == 1 else 'acid'
+        ls  = '-' if acid_base[i] == 1 else '--'
+        ax_pka.plot(epochs, pKa_hist[:, i], color=colors_n[i], linestyle=ls,
+                    linewidth=2, label=f'{SPECIES_NAMES[i]} ({ab})')
+    ax_pka.set_ylim(3, 10)
+    ax_pka.set_xlabel('Epoch', fontsize=11)
+    ax_pka.set_ylabel('pKa', fontsize=11)
+    ax_pka.set_title('pKa evolution', fontsize=12)
+    ax_pka.legend(fontsize=8, loc='best')
+    ax_pka.grid(alpha=0.25)
+
+    # -------------------------------------------------------------------
+    # Panel 3: φ and J evolution
+    # -------------------------------------------------------------------
+    ax_phiJ.plot(epochs, phi_hist, color='#2980b9', linewidth=2, label='φ (steric)')
+    ax_phiJ.set_ylim(0, 1.05)
+    ax_phiJ.set_xlabel('Epoch', fontsize=11)
+    ax_phiJ.set_ylabel('φ', color='#2980b9', fontsize=11)
+    ax_phiJ.tick_params(axis='y', labelcolor='#2980b9')
+    ax_phiJ2 = ax_phiJ.twinx()
+    ax_phiJ2.plot(epochs, J_hist, color='#c0392b', linewidth=2, label='J (kT)')
+    ax_phiJ2.set_ylabel('J  (kT)', color='#c0392b', fontsize=11)
+    ax_phiJ2.tick_params(axis='y', labelcolor='#c0392b')
+    ax_phiJ.set_title('φ and J evolution', fontsize=12)
+    lines1, labs1 = ax_phiJ.get_legend_handles_labels()
+    lines2, labs2 = ax_phiJ2.get_legend_handles_labels()
+    ax_phiJ.legend(lines1 + lines2, labs1 + labs2, fontsize=9, loc='best')
+    ax_phiJ.grid(alpha=0.25)
+
+    # -------------------------------------------------------------------
+    # Panel 4: Concentration time series (equil + schedule)
+    # -------------------------------------------------------------------
+    # Build time axis
+    equil_states = np.array(equil_traj)    # (n_pts, state_dim)
+    t_equil      = np.linspace(0.0, equil_duration, len(equil_states))
+
+    sched_states = np.concatenate([np.array(tr) for tr in schedule_trajs], axis=0)
+    n_sched_pts  = len(sched_states)
+    t_sched      = np.linspace(equil_duration,
+                               equil_duration + len(pH_schedule) * duration_per_seg,
+                               n_sched_pts)
+
+    all_states_conc = np.concatenate([equil_states, sched_states], axis=0)
+    t_all_conc      = np.concatenate([t_equil, t_sched])
+
+    # Free monomers
+    for i in range(n):
+        c = COLOR_BASE if acid_base[i] == 1 else COLOR_ACID
+        ax_conc.plot(t_all_conc, all_states_conc[:, i],
+                     color=c, linewidth=1.8, label=f'[{SPECIES_NAMES[i]}]')
+
+    # Dimers
+    for k, (ii, jj) in enumerate(zip(i_idx, j_idx)):
+        lbl = f'[{SPECIES_NAMES[ii]}–{SPECIES_NAMES[jj]}]'
+        if correct_mask_np[ii, jj]:
+            ax_conc.plot(t_all_conc, all_states_conc[:, n + k],
+                         color=COLOR_CORRECT, linewidth=2.2, label=lbl)
+        else:
+            ax_conc.plot(t_all_conc, all_states_conc[:, n + k],
+                         color='#aaaaaa', linewidth=0.7, alpha=0.5)
+
+    # Mass conservation line  M(t) = Σ[Xi] + 2·Σ[XiXj]
+    M_t = (all_states_conc[:, :n].sum(axis=1) +
+           2.0 * all_states_conc[:, n:].sum(axis=1))
+    ax_conc.plot(t_all_conc, M_t, 'k--', linewidth=1.8,
+                 label='M(t) = Σ[Xᵢ] + 2·Σ[XᵢXⱼ]  (should = 1)')
+
+    # Segment shading
+    seg_colors = ['#2980b9', '#27ae60', '#c0392b', '#8e44ad', '#d35400']
+    ax_conc.axvspan(0, equil_duration, alpha=0.05, color='grey',
+                    label='pH 7 equilibration')
+    for s_i, pH_v in enumerate(pH_schedule):
+        t0 = equil_duration + s_i * duration_per_seg
+        t1 = equil_duration + (s_i + 1) * duration_per_seg
+        ax_conc.axvspan(t0, t1, alpha=0.08, color=seg_colors[s_i % len(seg_colors)])
+        ax_conc.text((t0 + t1) / 2, ax_conc.get_ylim()[1] * 0.97,
+                     f'pH {pH_v:.0f}', ha='center', va='top',
+                     fontsize=9, color='#333333')
+
+    ax_conc.axvline(equil_duration, color='grey', linewidth=1.0,
+                    linestyle=':', alpha=0.7)
+    ax_conc.set_xlabel('Time', fontsize=11)
+    ax_conc.set_ylabel('Concentration', fontsize=11)
+    ax_conc.set_title(f'Concentrations — target schedule {pH_schedule}', fontsize=12)
+    ax_conc.legend(fontsize=7.5, loc='upper right', ncol=2)
+    ax_conc.grid(alpha=0.2)
+
+    # -------------------------------------------------------------------
+    # Panel 5: Free energy ΔG_{ij}(pH)
+    # -------------------------------------------------------------------
+    pHs = np.linspace(2, 12, 300)
+    for k, (ii, jj) in enumerate(zip(i_idx, j_idx)):
+        qs = np.array([
+            float(henderson_hasselbalch(
+                jnp.array(pKa), ph, jnp.array(acid_base)
+            )[ii]) *
+            float(henderson_hasselbalch(
+                jnp.array(pKa), ph, jnp.array(acid_base)
+            )[jj])
+            for ph in pHs
+        ])
+        phi_fac = 1.0 if correct_mask_np[ii, jj] else phi
+        dG_line = J * phi_fac * qs
+        lbl = f'{SPECIES_NAMES[ii]}–{SPECIES_NAMES[jj]}'
+        if correct_mask_np[ii, jj]:
+            ax_dG.plot(pHs, dG_line, linewidth=2.2, color=COLOR_CORRECT,
+                       label=lbl + ' ✓')
+        else:
+            ax_dG.plot(pHs, dG_line, linewidth=0.8, linestyle='--',
+                       color='#aaaaaa', alpha=0.6)
+
+    ax_dG.axhline(0, color='black', linewidth=0.7)
+    for pH_v in pH_schedule:
+        ax_dG.axvline(pH_v, color='#e74c3c', linewidth=0.9, linestyle=':',
+                      alpha=0.7)
+    ax_dG.set_xlabel('pH', fontsize=11)
+    ax_dG.set_ylabel('ΔG  (kT)', fontsize=11)
+    ax_dG.set_title('Dimer free energy vs pH\n(trained params, schedule pH shown ·)', fontsize=11)
+    ax_dG.legend(fontsize=8)
+    ax_dG.grid(alpha=0.25)
+
+    # -------------------------------------------------------------------
+    # Panel 6: Bar chart — response to all schedules
+    # -------------------------------------------------------------------
+    xs     = np.arange(len(all_schedules))
+    colors_bar = ['#27ae60' if i == target_idx else '#e74c3c'
+                  for i in range(len(all_schedules))]
+    bars = ax_bar.bar(xs, final_scores, color=colors_bar, edgecolor='white',
+                      linewidth=0.5)
+    ax_bar.set_xticks(xs)
+    ax_bar.set_xticklabels(
+        [str(s) for s in all_schedules],
+        rotation=40, ha='right', fontsize=9
+    )
+    ax_bar.set_ylabel('Correct-bond fraction', fontsize=11)
+    ax_bar.set_title('Response to all pH-schedule permutations  '
+                     '(green = target, red = others)', fontsize=12)
+    ax_bar.set_ylim(0, min(1.05, max(final_scores) * 1.25 + 0.02))
+    ax_bar.grid(axis='y', alpha=0.25)
+    # Annotate bars
+    for b, v in zip(bars, final_scores):
+        ax_bar.text(b.get_x() + b.get_width() / 2, v + 0.002,
+                    f'{v:.3f}', ha='center', va='bottom', fontsize=8)
+
+    patches = [
+        mpatches.Patch(color='#27ae60', label='Target schedule'),
+        mpatches.Patch(color='#e74c3c', label='Other permutations'),
+    ]
+    ax_bar.legend(handles=patches, fontsize=9)
+
+    # -------------------------------------------------------------------
+    fig.suptitle('CRN_AD — Training Summary', fontsize=15, fontweight='bold', y=1.01)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f'  Saved: {save_path}')
+    plt.close(fig)
+    return save_path

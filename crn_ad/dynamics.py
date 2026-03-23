@@ -138,7 +138,8 @@ def simulate_segment(state, pH, duration,
         correct_mask, n, i_idx, j_idx
     )
 
-    traj = odeint(ode_fn, state, t_span, pKa, phi, J, rtol=1e-5, atol=1e-7)
+    traj = odeint(ode_fn, state, t_span, pKa, phi, J,
+                  rtol=1e-4, atol=1e-6, mxstep=1000)
     return traj[-1], traj
 
 
@@ -188,7 +189,8 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
             s, t, _pKa, acid_base, _phi, _J,
             beta, k0, pH, correct_mask, n, i_idx, j_idx
         )
-        traj = odeint(ode_fn, state, t_span, pKa, phi, J, rtol=1e-5, atol=1e-7)
+        traj = odeint(ode_fn, state, t_span, pKa, phi, J,
+                  rtol=1e-4, atol=1e-6, mxstep=1000)
         return traj[-1], None
 
     final_state, _ = jax.lax.scan(segment_fn, initial_state, pH_schedule_array)
