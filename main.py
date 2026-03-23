@@ -83,6 +83,19 @@ def build_parser():
     p.add_argument('--animate', action='store_true',
                    help='Also generate animated GIFs (requires Pillow).')
     p.add_argument('--seed', type=int, default=42)
+    # New flags
+    p.add_argument('--J_max', type=float, default=3.5,
+                   help='Hard upper cap on J (kT).  Increase carefully — large J '
+                        'makes the ODE stiff.  Smooth-pH mode (--smooth_width) '
+                        'helps stability when J_max > 3.5.')
+    p.add_argument('--smooth_width', type=float, default=0.0,
+                   help='If > 0, pH transitions are smoothed with a logistic sigmoid '
+                        'over this many time units.  Reduces adjoint NaNs caused by '
+                        'RHS discontinuities at segment boundaries.  Try 1–3.')
+    p.add_argument('--S_max', type=float, default=0.0,
+                   help='If > 0, add per-dimer conformational-entropy parameters '
+                        'ΔS_ij ∈ [0, S_max] (kT) that are optimised by autodiff. '
+                        'Positive ΔS makes dimerisation less favourable.')
     return p
 
 
@@ -104,7 +117,8 @@ def open_file(path):
 
 
 def static_from_saved(pdata, beta, k0, n_points_sim=40,
-                      n_points_equil=60, equil_duration=200.0, tau=5.0):
+                      n_points_equil=60, equil_duration=80.0, tau=5.0,
+                      J_max=3.5, S_max=0.0, smooth_width=0.0):
     n = pdata['n_species']
     acid_base_np    = np.array([i % 2 for i in range(n)], dtype=int)
     correct_mask_np = np.zeros((n, n), dtype=bool)
@@ -132,47 +146,37 @@ def static_from_saved(pdata, beta, k0, n_points_sim=40,
         'n_points_equil'  : int(n_points_equil),
         'equil_duration'  : float(equil_duration),
         'tau'             : float(tau),
+        'J_max'           : float(J_max),
+        'S_max'           : float(S_max),
+        'smooth_width'    : float(smooth_width),
     }
 
 
 def get_equil_and_schedule_traj(p, static, target_sched, duration):
-    """
-    Run pH-7 equilibration then target schedule; return trajectories.
+    """Run pH-7 equilibration then target schedule; return trajectories."""
+    n            = static['n']
+    initial      = make_initial_state(n)
+    entropy_triu = _entropy_array(p, static)
 
-    Returns
-    -------
-    equil_traj     : array (n_pts, state_dim)
-    schedule_trajs : list of arrays (n_pts, state_dim), one per segment
-    final_state    : last state
-    """
-    n = static['n']
-    initial = make_initial_state(n)
-
-    # --- Equilibration ---
     equil_final, equil_traj = simulate_schedule(
-        initial,
-        [7.0],
-        static['equil_duration'],
+        initial, [7.0], static['equil_duration'],
         jnp.array(p['pKa']), static['acid_base'],
         jnp.array(p['phi']), jnp.array(p['J']),
         static['beta'], static['k0'],
-        static['correct_mask'], n,
-        static['i_idx'], static['j_idx'],
+        static['correct_mask'], n, static['i_idx'], static['j_idx'],
         n_points=static['n_points_equil'],
+        entropy_triu=entropy_triu,
     )
-    equil_traj = equil_traj[0]   # single segment
+    equil_traj = equil_traj[0]
 
-    # --- Schedule ---
     final_state, schedule_trajs = simulate_schedule(
-        equil_final,
-        target_sched,
-        duration,
+        equil_final, target_sched, duration,
         jnp.array(p['pKa']), static['acid_base'],
         jnp.array(p['phi']), jnp.array(p['J']),
         static['beta'], static['k0'],
-        static['correct_mask'], n,
-        static['i_idx'], static['j_idx'],
+        static['correct_mask'], n, static['i_idx'], static['j_idx'],
         n_points=static['n_points_equil'],
+        entropy_triu=entropy_triu,
     )
     return equil_traj, schedule_trajs, final_state
 
@@ -181,21 +185,21 @@ def compute_all_scores(p, static, all_schedules, duration):
     """Run all schedule permutations and return scores array."""
     n            = static['n']
     initial      = make_initial_state(n)
-    scores       = []
     pKa          = jnp.array(p['pKa'])
     phi          = jnp.array(p['phi'])
     J            = jnp.array(p['J'])
+    entropy_triu = _entropy_array(p, static)
 
-    # Shared equilibrium state
     equil_final, _ = simulate_schedule(
         initial, [7.0], static['equil_duration'],
         pKa, static['acid_base'], phi, J,
         static['beta'], static['k0'],
         static['correct_mask'], n, static['i_idx'], static['j_idx'],
         n_points=static['n_points_equil'],
+        entropy_triu=entropy_triu,
     )
-    equil_final = equil_final
 
+    scores = []
     for sched in all_schedules:
         final, _ = simulate_schedule(
             equil_final, sched, duration,
@@ -203,11 +207,17 @@ def compute_all_scores(p, static, all_schedules, duration):
             static['beta'], static['k0'],
             static['correct_mask'], n, static['i_idx'], static['j_idx'],
             n_points=static['n_points_sim'],
+            entropy_triu=entropy_triu,
         )
-        scores.append(float(correct_bond_score(
-            final, n, static['correct_triu_idx']
-        )))
+        scores.append(float(correct_bond_score(final, n, static['correct_triu_idx'])))
     return np.array(scores)
+
+
+def _entropy_array(p, static):
+    """Return entropy JAX array or None."""
+    if static.get('S_max', 0.0) > 0.0 and 'entropy' in p and p['entropy'] is not None:
+        return jnp.array(p['entropy'])
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +249,9 @@ def main():
             n_points_equil     = args.n_points_equil,
             tau                = args.tau,
             seed               = args.seed,
+            J_max              = args.J_max,
+            smooth_width       = args.smooth_width,
+            S_max              = args.S_max,
         )
 
         print('=' * 60)
@@ -249,7 +262,7 @@ def main():
         (raw_params, loss_history, score_history, param_history,
          static, all_schedules, target_idx, equil_state) = result
 
-        p = constrain_params(raw_params)
+        p = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max)
         # Save params
         params_out = {
             'n_species'          : args.n_species,
@@ -259,18 +272,27 @@ def main():
             'J'                  : float(p['J']),
             'beta'               : args.beta,
             'k0'                 : args.k0,
+            'J_max'              : args.J_max,
+            'S_max'              : args.S_max,
         }
+        if args.S_max > 0.0 and 'entropy' in p:
+            params_out['entropy'] = np.array(p['entropy']).tolist()
         with open(params_path, 'w') as f:
             json.dump(params_out, f, indent=2)
         print(f'Saved trained params → {params_path}')
 
-        # Print summary
         print('\n— Trained parameters —')
         for i in range(args.n_species):
             ab = 'base' if int(static['acid_base'][i]) == 1 else 'acid'
             print(f'  {SPECIES_NAMES[i]} ({ab:<4s}): pKa = {float(p["pKa"][i]):.3f}')
         print(f'  φ = {float(p["phi"]):.4f}')
         print(f'  J = {float(p["J"]):.4f}  kT')
+        if args.S_max > 0.0 and 'entropy' in p:
+            from crn_ad.dynamics import make_triu_indices as _mti
+            _ii, _jj = _mti(args.n_species)
+            for k, (ii, jj) in enumerate(zip(_ii, _jj)):
+                print(f'  ΔS[{SPECIES_NAMES[ii]}–{SPECIES_NAMES[jj]}] = '
+                      f'{float(p["entropy"][k]):.4f}  kT')
 
     # =====================================================================
     # Load params if animate-only mode
@@ -281,12 +303,17 @@ def main():
             sys.exit(1)
         with open(params_path) as f:
             pdata = json.load(f)
+        _J_max = float(pdata.get('J_max', args.J_max))
+        _S_max = float(pdata.get('S_max', args.S_max))
         static = static_from_saved(
             pdata, pdata['beta'], pdata['k0'],
             args.n_points_sim, args.n_points_equil,
             args.equil_duration, args.tau,
+            J_max=_J_max, S_max=_S_max,
+            smooth_width=args.smooth_width,
         )
-        p = {'pKa': pdata['pKa'], 'phi': pdata['phi'], 'J': pdata['J']}
+        p = {'pKa': pdata['pKa'], 'phi': pdata['phi'], 'J': pdata['J'],
+             'entropy': pdata.get('entropy', None)}
         target_sched  = [float(x) for x in pdata['target_pH_schedule']]
         all_schedules = all_unique_permutations(target_sched)
         target_idx    = all_schedules.index(target_sched)
@@ -298,31 +325,25 @@ def main():
         target_sched = [float(x) for x in args.target_pH]
 
     # =====================================================================
-    # SUMMARY PLOT (always produced after training or in animate mode)
+    # SUMMARY PLOT
     # =====================================================================
     if args.mode in ('train', 'both', 'animate'):
         print('\nGenerating summary plot ...')
 
-        # Run target schedule trajectory for concentration panel
-        equil_traj, schedule_trajs, final_state = get_equil_and_schedule_traj(
-            {'pKa': np.array(p['pKa']) if args.mode == 'animate'
-                    else np.array(constrain_params(raw_params)['pKa']),
-             'phi': float(p['phi']) if args.mode == 'animate'
-                    else float(constrain_params(raw_params)['phi']),
-             'J':   float(p['J']) if args.mode == 'animate'
-                    else float(constrain_params(raw_params)['J'])},
-            static, target_sched, args.duration,
-        )
+        if args.mode == 'animate':
+            p_eval = p
+        else:
+            p_eval = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max)
+            # Convert JAX arrays to plain numpy/python for downstream functions
+            p_eval = {k: (np.array(v) if hasattr(v, 'shape') else float(v))
+                      for k, v in p_eval.items()}
 
-        # Scores for all schedules
+        equil_traj, schedule_trajs, _ = get_equil_and_schedule_traj(
+            p_eval, static, target_sched, args.duration)
+
         print('  Scoring all schedule permutations ...')
-        p_eval = constrain_params(raw_params) if args.mode != 'animate' else \
-                 {'pKa': p['pKa'], 'phi': p['phi'], 'J': p['J']}
-        final_scores = compute_all_scores(
-            p_eval, static, all_schedules, args.duration
-        )
+        final_scores = compute_all_scores(p_eval, static, all_schedules, args.duration)
 
-        # If we just trained, use the already-recorded param/score history
         if args.mode == 'animate':
             loss_history  = [0.0]
             score_history = [final_scores]
@@ -330,11 +351,12 @@ def main():
                                'phi': float(p_eval['phi']),
                                'J':   float(p_eval['J'])}]
 
-        # Trained params dict (constrained, numpy)
         trained_params = {
-            'pKa': np.array(p_eval['pKa']),
-            'phi': float(p_eval['phi']),
-            'J':   float(p_eval['J']),
+            'pKa'    : np.array(p_eval['pKa']),
+            'phi'    : float(p_eval['phi']),
+            'J'      : float(p_eval['J']),
+            'entropy': (np.array(p_eval['entropy'])
+                        if p_eval.get('entropy') is not None else None),
         }
 
         plot_summary(

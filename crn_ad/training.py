@@ -3,10 +3,8 @@ Loss function and training loop.
 
 Starting state
 --------------
-Rather than a β=0 'denatured' state, we now equilibrate at pH 7 with the
-CURRENT trained parameters (β=1) for a long time before every schedule run.
-This gives a physically motivated resting state (the polymer at physiological
-pH) and means the gradient flows through the equilibration step.
+Equilibrate at pH 7 with CURRENT trained parameters (β=1) for
+`equil_duration` time units before every schedule run.
 
 Loss design
 -----------
@@ -15,8 +13,23 @@ Multi-class cross-entropy (InfoNCE / KL divergence):
     L = −log_softmax(τ · scores)[target_idx]
       = KL(δ_target ‖ softmax(τ · scores))
 
-Maximises correct-bond fraction under the target schedule while simultaneously
-suppressing it under all permutation schedules.
+NaN stability strategy
+-----------------------
+Several mechanisms work together to prevent and recover from NaN:
+
+1. J hard cap via sigmoid: J ∈ [0.5, J_max] prevents ODE stiffness.
+2. Smooth pH transitions: eliminates RHS discontinuities at segment
+   boundaries that trigger tiny adjoint steps.
+3. Gradient NaN zeroing: any NaN/Inf gradient components are zeroed
+   before the Adam update (JAX-native, inside the JIT'd step).
+4. Gradient norm clipping: global-norm clip applied before Adam.
+5. Adaptive learning rate: lr is passed as a traced argument so it
+   can be halved at runtime without recompiling.  On NaN detection the
+   Python loop reverts to the last *finite* params, resets Adam
+   momentum (stale moments contain bad curvature info), and halves lr.
+6. Finite-param guard: best_params is only updated when BOTH the loss
+   AND all parameter arrays are finite (fixes the silent NaN capture
+   bug where lv was finite but params had already gone NaN).
 """
 
 import jax
@@ -34,25 +47,45 @@ from .dynamics import (simulate_schedule, simulate_schedule_scan,
 # Parameter constraints
 # ---------------------------------------------------------------------------
 
-def constrain_params(raw):
-    """Map unconstrained (ℝ) raw parameters to physical ranges."""
-    return {
-        'pKa': 3.0 + 7.0 * jax.nn.sigmoid(raw['pKa']),   # [3, 10]
-        'phi': jax.nn.sigmoid(raw['phi']),                  # [0, 1]
-        'J':   0.5 + 3.0 * jax.nn.sigmoid(raw['J']),      # [0.5, 3.5] — hard cap prevents stiff ODE
+def constrain_params(raw, J_max=3.5, S_max=0.0):
+    """
+    Map unconstrained (ℝ) raw parameters to physical ranges.
+
+    pKa     ∈ [3, 10]       via  3 + 7·σ(raw_pKa)
+    phi     ∈ [0, 1]        via  σ(raw_phi)
+    J       ∈ [0.5, J_max]  via  0.5 + (J_max−0.5)·σ(raw_J)
+    entropy ∈ [0, S_max]    via  S_max·σ(raw_entropy)   (if S_max > 0)
+    """
+    out = {
+        'pKa': 3.0 + 7.0 * jax.nn.sigmoid(raw['pKa']),
+        'phi': jax.nn.sigmoid(raw['phi']),
+        'J':   0.5 + (J_max - 0.5) * jax.nn.sigmoid(raw['J']),
     }
+    if S_max > 0.0:
+        out['entropy'] = S_max * jax.nn.sigmoid(raw['entropy'])
+    return out
 
 
-def unconstrain_params(phys):
+def unconstrain_params(phys, J_max=3.5, S_max=0.0):
     """Inverse of constrain_params for warm-starting."""
-    pKa_norm = (jnp.array(phys['pKa']) - 3.0) / 7.0
-    pKa_norm = jnp.clip(pKa_norm, 1e-4, 1 - 1e-4)
-    phi_val   = jnp.clip(jnp.array(phys['phi']), 1e-4, 1 - 1e-4)
-    return {
+    pKa_norm = jnp.clip((jnp.array(phys['pKa']) - 3.0) / 7.0, 1e-4, 1 - 1e-4)
+    phi_val  = jnp.clip(jnp.array(phys['phi']), 1e-4, 1 - 1e-4)
+    J_norm   = jnp.clip((jnp.array(phys['J']) - 0.5) / (J_max - 0.5), 1e-4, 1 - 1e-4)
+    out = {
         'pKa': jnp.log(pKa_norm / (1.0 - pKa_norm)),
-        'phi': jnp.log(phi_val / (1.0 - phi_val)),
-        'J':   jnp.log(jnp.exp(jnp.array(phys['J']) - 0.5) - 1.0 + 1e-6),
+        'phi': jnp.log(phi_val  / (1.0 - phi_val)),
+        'J':   jnp.log(J_norm   / (1.0 - J_norm)),
     }
+    if S_max > 0.0 and 'entropy' in phys:
+        s_norm = jnp.clip(jnp.array(phys['entropy']) / S_max, 1e-4, 1 - 1e-4)
+        out['entropy'] = jnp.log(s_norm / (1.0 - s_norm))
+    return out
+
+
+def _params_finite(params):
+    """True iff every leaf of the params pytree is finite."""
+    leaves = jax.tree_util.tree_leaves(params)
+    return all(bool(jnp.all(jnp.isfinite(v))) for v in leaves)
 
 
 # ---------------------------------------------------------------------------
@@ -64,8 +97,6 @@ def correct_bond_score(state, n, correct_triu_idx):
     Fraction of total monomer content residing in correct dimers.
 
         score = 2·Σ_{correct} [XᵢXⱼ] / (Σᵢ [Xᵢ] + 2·Σ_{i≤j} [XᵢXⱼ])
-
-    The denominator is the conserved total monomer content (= 1 initially).
     """
     free       = state[:n]
     dimer_triu = state[n:]
@@ -94,7 +125,7 @@ def all_unique_permutations(seq):
 
 
 # ---------------------------------------------------------------------------
-# Loss  (vmap over schedules, lax.scan over segments, includes pre-equilibration)
+# Loss
 # ---------------------------------------------------------------------------
 
 def compute_loss(raw_params, all_pH_schedules_array, target_idx,
@@ -102,50 +133,29 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     """
     Softmax cross-entropy loss.
 
-    Procedure
-    ---------
-    1. Equilibrate the system at pH 7 with the CURRENT trained parameters
-       for `static['equil_duration']` time units.  This gives the resting
-       state before the experiment (β=1, pH=7, current pKa/φ/J).
-    2. Run each schedule permutation from that equilibrium state.
-    3. Compute the correct-bond fraction for each schedule.
-    4. Return −log_softmax(τ · scores)[target_idx].
-
-    The gradient flows back through both the schedule simulation and the
-    pH-7 equilibration step.
-
-    Args
-    ----
-    raw_params              : dict of unconstrained JAX arrays
-    all_pH_schedules_array  : (n_schedules, n_segments) JAX float array
-    target_idx              : int
-    duration_per_seg        : float
-    static                  : dict of non-differentiated quantities
-    initial_state           : JAX array (n + n*(n+1)//2,), all monomers free
-
-    Returns
-    -------
-    (loss, scores)
+    1. Equilibrate at pH 7 with current parameters.
+    2. Run each schedule permutation from equilibrium.
+    3. Return −log_softmax(τ · scores)[target_idx].
     """
-    p = constrain_params(raw_params)
+    p = constrain_params(raw_params,
+                         J_max=static['J_max'],
+                         S_max=static.get('S_max', 0.0))
 
-    # ------------------------------------------------------------------
-    # Step 1: equilibrate at pH 7 with current parameters
-    # ------------------------------------------------------------------
+    entropy_triu = p.get('entropy', None)
+
     equil_state = simulate_schedule_scan(
         initial_state,
-        jnp.array([7.0]),          # single pH-7 segment
+        jnp.array([7.0]),
         static['equil_duration'],
         p['pKa'], static['acid_base'], p['phi'], p['J'],
         static['beta'], static['k0'],
         static['correct_mask'], static['n'],
         static['i_idx'], static['j_idx'],
-        n_points=static['n_points_equil'],
+        n_points    = static['n_points_equil'],
+        smooth_width= static.get('smooth_width', 0.0),
+        entropy_triu= entropy_triu,
     )
 
-    # ------------------------------------------------------------------
-    # Step 2: score each schedule from the pH-7 equilibrium
-    # ------------------------------------------------------------------
     def score_one_schedule(pH_sched):
         final = simulate_schedule_scan(
             equil_state,
@@ -155,15 +165,16 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
             static['beta'], static['k0'],
             static['correct_mask'], static['n'],
             static['i_idx'], static['j_idx'],
-            n_points=static['n_points_sim'],
+            n_points    = static['n_points_sim'],
+            smooth_width= static.get('smooth_width', 0.0),
+            entropy_triu= entropy_triu,
         )
         return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
     scores = jax.vmap(score_one_schedule)(all_pH_schedules_array)
-
-    tau   = static.get('tau', 5.0)
-    log_p = jax.nn.log_softmax(scores * tau)
-    loss  = -log_p[target_idx]
+    tau    = static.get('tau', 5.0)
+    log_p  = jax.nn.log_softmax(scores * tau)
+    loss   = -log_p[target_idx]
     return loss, scores
 
 
@@ -180,30 +191,29 @@ def train(config):
     n_species          : int (even, ≤ 10)
     target_pH_schedule : list[float]
     duration_per_seg   : float
-    equil_duration     : float   (pH-7 pre-equilibration time, default 200)
+    equil_duration     : float   (default 80)
     n_epochs           : int
     learning_rate      : float
     beta               : float   (default 1.0)
     k0                 : float   (default 1.0)
-    n_points_sim       : int     (ODE points per schedule segment, default 40)
-    n_points_equil     : int     (ODE points for equilibration, default 60)
-    tau                : float   (softmax temperature, default 5.0)
+    n_points_sim       : int     (default 40)
+    n_points_equil     : int     (default 60)
+    tau                : float   (default 5.0)
+    J_max              : float   (default 3.5)
+    smooth_width       : float   (default 0.0 = sharp transitions)
+    S_max              : float   (default 0.0 = no entropy params)
     seed               : int
-
-    Returns
-    -------
-    raw_params, loss_history, score_history, param_history,
-    static, all_schedules, target_idx, equil_state
     """
     n = config['n_species']
     assert n % 2 == 0 and 2 <= n <= 10, "n_species must be even and in [2, 10]"
 
+    J_max  = float(config.get('J_max',  3.5))
+    S_max  = float(config.get('S_max',  0.0))
+    smooth = float(config.get('smooth_width', 0.0))
+
     # ------------------------------------------------------------------
-    # Static (non-differentiated) quantities
+    # Static quantities
     # ------------------------------------------------------------------
-    # Even index → base-like (positive at low pH)
-    # Odd index  → acid-like (negative at high pH)
-    # Adjacent pairs (0,1),(2,3),... carry opposite charges → attract.
     acid_base_np    = np.array([i % 2 for i in range(n)], dtype=int)
     correct_mask_np = np.zeros((n, n), dtype=bool)
     for k in range(n // 2):
@@ -228,11 +238,14 @@ def train(config):
         'j_idx'           : j_idx,
         'correct_triu_idx': jnp.array(correct_triu_idx),
         'beta'            : float(config.get('beta', 1.0)),
-        'k0'              : float(config.get('k0', 1.0)),
-        'n_points_sim'    : int(config.get('n_points_sim', 40)),
+        'k0'              : float(config.get('k0',  1.0)),
+        'n_points_sim'    : int(config.get('n_points_sim',   40)),
         'n_points_equil'  : int(config.get('n_points_equil', 60)),
         'equil_duration'  : float(config.get('equil_duration', 80.0)),
         'tau'             : float(config.get('tau', 5.0)),
+        'J_max'           : J_max,
+        'S_max'           : S_max,
+        'smooth_width'    : smooth,
     }
 
     # ------------------------------------------------------------------
@@ -248,46 +261,54 @@ def train(config):
     print(f"Target sched : {target_sched}")
     print(f"Permutations : {len(all_schedules)}  (target idx = {target_idx})")
     print(f"Equilibration: pH 7,  t = {static['equil_duration']} (β=1, current params)")
+    print(f"J_max        : {J_max}  kT")
+    print(f"Smooth width : {smooth}  time units  ({'enabled' if smooth > 0 else 'disabled'})")
+    if S_max > 0:
+        n_entropy = n * (n + 1) // 2
+        print(f"Entropy params: {n_entropy}  (S_max = {S_max} kT)")
 
     # ------------------------------------------------------------------
-    # Initial state (all monomers free, no dimers)
+    # Initial state
     # ------------------------------------------------------------------
     initial_state = make_initial_state(n)
 
     # ------------------------------------------------------------------
     # Initialise trainable parameters
     # ------------------------------------------------------------------
-    rng = np.random.default_rng(int(config.get('seed', 42)))
-
-    # Acid-like species: pKa near pH_min+1 → charged (negative) across schedule
-    # Base-like species: pKa near pH_max-1 → charged (positive) across schedule
-    # This maximises salt-bridge driving force from the start.
+    rng    = np.random.default_rng(int(config.get('seed', 42)))
     pH_min = float(min(target_sched))
     pH_max = float(max(target_sched))
     pKa_init = []
     for i in range(n):
-        if acid_base_np[i] == 0:   # acid-like
+        if acid_base_np[i] == 0:
             centre = np.clip(pH_min + 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
-        else:                       # base-like
+        else:
             centre = np.clip(pH_max - 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
         pKa_init.append(float(centre))
 
-    # Cap J raw so that constrained J = softplus(raw)+0.5 ≤ 3.5 initially
-    raw_params = unconstrain_params({
+    init_phys = {
         'pKa': jnp.array(pKa_init),
         'phi': jnp.array(0.2),
-        'J'  : jnp.array(1.5),      # softplus(1.5)+0.5 ≈ 2.3 kT
-    })
+        'J'  : jnp.array(1.5),
+    }
+    if S_max > 0.0:
+        n_entropy = n * (n + 1) // 2
+        init_phys['entropy'] = jnp.zeros(n_entropy)   # start at ΔS=0
+
+    raw_params = unconstrain_params(init_phys, J_max=J_max, S_max=S_max)
 
     # ------------------------------------------------------------------
-    # Optimiser
+    # Optimiser  (lr is a *traced* argument — no recompile needed to change it)
     # ------------------------------------------------------------------
+    clip_norm = float(config.get('clip_norm', 0.5))
     lr        = float(config.get('learning_rate', 0.02))
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(0.5),   # strict clipping to prevent NaN
-        optax.adam(lr),
+
+    # Core optimiser without LR (applied manually so lr can vary at runtime)
+    _opt_core = optax.chain(
+        optax.clip_by_global_norm(clip_norm),
+        optax.scale_by_adam(),
     )
-    opt_state = optimizer.init(raw_params)
+    opt_state = _opt_core.init(raw_params)
 
     # ------------------------------------------------------------------
     # JIT-compiled step
@@ -302,16 +323,28 @@ def train(config):
     )
 
     @jax.jit
-    def step(raw_params, opt_state):
+    def step(raw_params, opt_state, lr_val):
         (loss_val, scores), grads = jax.value_and_grad(
             loss_fn, has_aux=True
         )(raw_params)
-        updates, new_opt_state = optimizer.update(grads, opt_state)
+
+        # Zero any NaN/Inf gradient components before they corrupt params.
+        # This is the JAX-native approach: replace bad values with zero so
+        # the step is skipped for those components rather than exploding.
+        grads = jax.tree_util.tree_map(
+            lambda g: jnp.where(jnp.isfinite(g), g, jnp.zeros_like(g)),
+            grads
+        )
+
+        updates, new_opt_state = _opt_core.update(grads, opt_state)
+        # Scale by learning rate (negative sign = gradient descent)
+        updates = jax.tree_util.tree_map(lambda u: -lr_val * u, updates)
         new_raw_params = optax.apply_updates(raw_params, updates)
         return new_raw_params, new_opt_state, loss_val, scores
 
     print("Compiling JAX graph (first call) ...", flush=True)
-    raw_params, opt_state, lv, sc = step(raw_params, opt_state)
+    lr_jax = jnp.array(lr)
+    raw_params, opt_state, lv, sc = step(raw_params, opt_state, lr_jax)
     print("Compilation done.\n")
 
     # ------------------------------------------------------------------
@@ -321,74 +354,84 @@ def train(config):
     loss_history  = [float(lv)]
     score_history = [np.array(sc)]
 
-    p0 = constrain_params(raw_params)
-    param_history = [{
-        'pKa': np.array(p0['pKa']),
-        'phi': float(p0['phi']),
-        'J'  : float(p0['J']),
-    }]
+    p0 = constrain_params(raw_params, J_max=J_max, S_max=S_max)
+    param_history = [_snapshot(p0, S_max)]
 
-    best_params  = raw_params   # track best finite params for NaN recovery
+    # Only track best params when BOTH loss AND all params are finite
+    best_params  = raw_params if _params_finite(raw_params) else None
     nan_count    = 0
+    max_nan_halvings = 6    # give up halving after this many consecutive NaNs
 
     for epoch in range(1, n_epochs):
-        new_params, new_opt, lv, sc = step(raw_params, opt_state)
+        new_params, new_opt, lv, sc = step(raw_params, opt_state, lr_jax)
 
-        # NaN guard: revert to best params with a reduced learning rate
-        if not np.isfinite(float(lv)):
-            nan_count += 1
-            if nan_count == 1:
-                print(f"  Warning: NaN at epoch {epoch} — reverting to best params")
-            raw_params = best_params
-            # reinitialise optimizer with smaller lr
-            lr_red    = lr * 0.3
-            optimizer = optax.chain(
-                optax.clip_by_global_norm(0.3),
-                optax.adam(lr_red),
-            )
-            opt_state = optimizer.init(raw_params)
-            lv = loss_history[-1]
-            sc = score_history[-1]
-        else:
+        loss_ok   = np.isfinite(float(lv))
+        params_ok = _params_finite(new_params)
+
+        if loss_ok and params_ok:
             raw_params = new_params
             opt_state  = new_opt
-            if float(lv) < min(loss_history):
+            nan_count  = 0
+            if best_params is None or float(lv) < min(loss_history):
                 best_params = raw_params
-            nan_count = 0
+        else:
+            nan_count += 1
+            if nan_count <= max_nan_halvings:
+                # Halve learning rate
+                lr      = lr * 0.5
+                lr_jax  = jnp.array(lr)
+                print(f"  NaN at epoch {epoch} — halving lr → {lr:.2e}", flush=True)
+            else:
+                if nan_count == max_nan_halvings + 1:
+                    print(f"  NaN persists after {max_nan_halvings} halvings; "
+                          f"holding at lr={lr:.2e}", flush=True)
+
+            if best_params is not None:
+                raw_params = best_params
+            # Reset Adam momentum — stale moments contain bad curvature info
+            opt_state = _opt_core.init(raw_params)
+            # Use last known-good values for history
+            lv = loss_history[-1]
+            sc = score_history[-1]
 
         loss_history.append(float(lv))
         score_history.append(np.array(sc))
-        p_cur = constrain_params(raw_params)
-        param_history.append({
-            'pKa': np.array(p_cur['pKa']),
-            'phi': float(p_cur['phi']),
-            'J'  : float(p_cur['J']),
-        })
+        p_cur = constrain_params(raw_params, J_max=J_max, S_max=S_max)
+        param_history.append(_snapshot(p_cur, S_max))
 
         if epoch % max(1, n_epochs // 15) == 0 or epoch == n_epochs - 1:
             pKa_str = ' '.join(f'{float(v):.2f}' for v in p_cur['pKa'])
+            entropy_str = ''
+            if S_max > 0.0:
+                ent_mean = float(jnp.mean(p_cur['entropy']))
+                ent_max  = float(jnp.max(p_cur['entropy']))
+                entropy_str = f' | S̄={ent_mean:.3f} S_max={ent_max:.3f}'
             print(
                 f"Epoch {epoch:4d}/{n_epochs} | "
                 f"loss={float(lv):.4f} | "
                 f"target={float(sc[target_idx]):.3f} | "
                 f"mean_other={float(jnp.mean(jnp.delete(sc, target_idx))):.3f} | "
                 f"pKa=[{pKa_str}] | "
-                f"φ={float(p_cur['phi']):.3f} | J={float(p_cur['J']):.3f}",
+                f"φ={float(p_cur['phi']):.3f} | J={float(p_cur['J']):.3f}"
+                f"{entropy_str}",
                 flush=True,
             )
 
     print("\nTraining complete.")
 
-    # Compute final equilibrium state for reporting / visualisation
-    p_final  = constrain_params(raw_params)
-    equil_state = simulate_schedule_scan(
+    # Final equilibrium state for reporting / visualisation
+    p_final      = constrain_params(raw_params, J_max=J_max, S_max=S_max)
+    entropy_triu = p_final.get('entropy', None)
+    equil_state  = simulate_schedule_scan(
         initial_state,
         jnp.array([7.0]),
         static['equil_duration'],
         p_final['pKa'], static['acid_base'], p_final['phi'], p_final['J'],
         static['beta'], static['k0'],
         static['correct_mask'], static['n'], static['i_idx'], static['j_idx'],
-        n_points=static['n_points_equil'],
+        n_points    = static['n_points_equil'],
+        smooth_width= smooth,
+        entropy_triu= entropy_triu,
     )
 
     return (
@@ -401,3 +444,15 @@ def train(config):
         target_idx,
         equil_state,
     )
+
+
+def _snapshot(p, S_max):
+    """Dict snapshot of constrained params for history recording."""
+    snap = {
+        'pKa': np.array(p['pKa']),
+        'phi': float(p['phi']),
+        'J'  : float(p['J']),
+    }
+    if S_max > 0.0 and 'entropy' in p:
+        snap['entropy'] = np.array(p['entropy'])
+    return snap
