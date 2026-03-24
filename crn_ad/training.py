@@ -331,16 +331,29 @@ def train(config):
             centre = np.clip(pH_max - 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
         pKa_init.append(float(centre))
 
+    phi_init = float(np.clip(0.2 + rng.normal(0.0, 0.05), 0.01, 0.99))
+    J_init   = float(np.clip(1.5 + rng.normal(0.0, 0.2),  0.51, J_max - 0.01))
+
     init_phys = {
         'pKa': jnp.array(pKa_init),
-        'phi': jnp.array(0.2),
-        'J'  : jnp.array(1.5),
+        'phi': jnp.array(phi_init),
+        'J'  : jnp.array(J_init),
     }
     if S_max > 0.0:
-        init_phys['monomer_entropy'] = jnp.zeros(n_entropy)
+        s_init = np.clip(
+            rng.uniform(0.0, 0.2 * S_max, n_entropy),
+            1e-4 * S_max, 0.999 * S_max,
+        )
+        init_phys['monomer_entropy'] = jnp.array(s_init)
 
     raw_params = unconstrain_params(init_phys, J_max=J_max, S_max=S_max)
-    initial_state = make_initial_state(n)
+
+    # Perturb initial free-monomer concentrations (±20 % multiplicative noise),
+    # then renormalise so total monomer content M = 1 is preserved.
+    free_init  = np.ones(n) / n * rng.uniform(0.8, 1.2, n)
+    free_init /= free_init.sum()
+    n_dimers   = n * (n + 1) // 2
+    initial_state = jnp.concatenate([jnp.array(free_init), jnp.zeros(n_dimers)])
 
     # ------------------------------------------------------------------
     # Optimiser  (lr passed as traced JAX array — no recompile on change)
