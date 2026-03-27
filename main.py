@@ -98,6 +98,12 @@ def build_parser():
     p.add_argument('--per_monomer_entropy', action='store_true',
                    help='If set, train a separate entropy value per monomer '
                         '(n values).  Default: one shared value for all.')
+    p.add_argument('--specific_bonds', action='store_true',
+                   help='If set, only species of the correct pairing can interact '
+                        '(e.g. any A with any B, but A cannot bind C, D, or another A). '
+                        'Equivalent to phi=0 between wrong-species pairs. '
+                        'Within the correct species pair, phi still controls the '
+                        'binding strength of type mismatches (A1-B2 etc.).')
     return p
 
 
@@ -119,7 +125,7 @@ def open_file(path):
 
 def _static_dict(n_species, T, beta, k0, n_points_sim, n_points_equil,
                  equil_duration, tau, J_max, S_max, smooth_width,
-                 per_monomer_entropy=False):
+                 per_monomer_entropy=False, specific_bonds=False):
     N = n_species * T
     acid_base_np    = np.array([(k // T) % 2 for k in range(N)], dtype=int)
     correct_mask_np = np.zeros((N, N), dtype=bool)
@@ -129,40 +135,53 @@ def _static_dict(n_species, T, beta, k0, n_points_sim, n_points_equil,
             j = (2 * pair_idx + 1) * T + t
             correct_mask_np[i, j] = True
             correct_mask_np[j, i] = True
+    species_pair_mask_np = np.zeros((N, N), dtype=bool)
+    for pair_idx in range(n_species // 2):
+        for t1 in range(T):
+            for t2 in range(T):
+                i = 2 * pair_idx * T + t1
+                j = (2 * pair_idx + 1) * T + t2
+                species_pair_mask_np[i, j] = True
+                species_pair_mask_np[j, i] = True
     i_idx, j_idx = make_triu_indices(N)
     correct_triu_idx = np.array([
         pos for pos, (ii, jj) in enumerate(zip(i_idx, j_idx))
         if correct_mask_np[ii, jj]
     ])
+    allowed_mask_jax = jnp.array(species_pair_mask_np) if specific_bonds else None
     return {
-        'n'               : N,
-        'n_species'       : n_species,
-        'T'               : T,
-        'acid_base'       : jnp.array(acid_base_np),
-        'acid_base_np'    : acid_base_np,
-        'correct_mask'    : jnp.array(correct_mask_np),
-        'correct_mask_np' : correct_mask_np,
-        'i_idx'           : i_idx,
-        'j_idx'           : j_idx,
-        'correct_triu_idx': jnp.array(correct_triu_idx),
-        'beta'            : float(beta),
-        'k0'              : float(k0),
-        'n_points_sim'    : int(n_points_sim),
-        'n_points_equil'  : int(n_points_equil),
-        'equil_duration'  : float(equil_duration),
-        'tau'             : float(tau),
-        'J_max'           : float(J_max),
-        'S_max'           : float(S_max),
-        'smooth_width'    : float(smooth_width),
-        'per_monomer_entropy': bool(per_monomer_entropy),
+        'n'                   : N,
+        'n_species'           : n_species,
+        'T'                   : T,
+        'acid_base'           : jnp.array(acid_base_np),
+        'acid_base_np'        : acid_base_np,
+        'correct_mask'        : jnp.array(correct_mask_np),
+        'correct_mask_np'     : correct_mask_np,
+        'species_pair_mask_np': species_pair_mask_np,
+        'i_idx'               : i_idx,
+        'j_idx'               : j_idx,
+        'correct_triu_idx'    : jnp.array(correct_triu_idx),
+        'beta'                : float(beta),
+        'k0'                  : float(k0),
+        'n_points_sim'        : int(n_points_sim),
+        'n_points_equil'      : int(n_points_equil),
+        'equil_duration'      : float(equil_duration),
+        'tau'                 : float(tau),
+        'J_max'               : float(J_max),
+        'S_max'               : float(S_max),
+        'smooth_width'        : float(smooth_width),
+        'per_monomer_entropy' : bool(per_monomer_entropy),
+        'specific_bonds'      : bool(specific_bonds),
+        'allowed_mask'        : allowed_mask_jax,
     }
 
 
 def get_equil_and_schedule_traj(p, static, target_sched, duration):
     """Run pH-7 equilibration then target schedule; return trajectories."""
-    n      = static['n']
-    T      = static.get('T', 1)
-    mono_s = _get_mono(p, static)
+    n            = static['n']
+    T            = static.get('T', 1)
+    allowed_mask = static.get('allowed_mask', None)
+    mono_s       = _get_mono(p, static)
 
     # Expand species-level pKa (n_species,) → particle-level (N,)
     pKa_arr  = jnp.array(p['pKa'])
@@ -178,6 +197,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
         static['correct_mask'], n, static['i_idx'], static['j_idx'],
         n_points=static['n_points_equil'],
         monomer_entropy=mono_s,
+        allowed_mask=allowed_mask,
     )
 
     final_state, schedule_trajs = simulate_schedule(
@@ -188,6 +208,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
         static['correct_mask'], n, static['i_idx'], static['j_idx'],
         n_points=static['n_points_equil'],
         monomer_entropy=mono_s,
+        allowed_mask=allowed_mask,
     )
     return equil_traj[0], schedule_trajs, final_state
 
@@ -233,6 +254,7 @@ def main():
             smooth_width         = args.smooth_width,
             S_max                = args.S_max,
             per_monomer_entropy  = args.per_monomer_entropy,
+            specific_bonds       = args.specific_bonds,
         )
 
         print('=' * 60)
@@ -259,6 +281,7 @@ def main():
             'J_max'             : args.J_max,
             'S_max'             : args.S_max,
             'per_monomer_entropy': args.per_monomer_entropy,
+            'specific_bonds'     : args.specific_bonds,
         }
         if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
             params_out['monomer_entropy'] = np.atleast_1d(
@@ -298,12 +321,13 @@ def main():
         _S_max  = float(pdata.get('S_max', args.S_max))
         _permon = bool(pdata.get('per_monomer_entropy', False))
         _T      = int(pdata.get('n_types', 1))
+        _specb  = bool(pdata.get('specific_bonds', False))
         static = _static_dict(
             pdata['n_species'], _T,
             pdata['beta'], pdata['k0'],
             args.n_points_sim, args.n_points_equil,
             args.equil_duration, args.tau,
-            _J_max, _S_max, args.smooth_width, _permon,
+            _J_max, _S_max, args.smooth_width, _permon, _specb,
         )
         p_eval = {
             'pKa': np.array(pdata['pKa']),

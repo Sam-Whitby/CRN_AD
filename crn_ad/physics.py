@@ -22,22 +22,26 @@ def henderson_hasselbalch(pKa, pH, acid_base):
 
 
 def interaction_energy_matrix(charges, correct_mask, phi, J,
-                               monomer_entropy=None):
+                               monomer_entropy=None, allowed_mask=None):
     """
     Free-energy matrix ΔG_{ij} for all monomer pairs.
 
+    Default (allowed_mask=None):
         ΔG_{ij} = J · q_i · q_j                (correct pairs)
-        ΔG_{ij} = φ · J · q_i · q_j            (incorrect pairs)
+        ΔG_{ij} = φ · J · q_i · q_j            (all other pairs)
+
+    With allowed_mask (--specific_bonds mode):
+        ΔG_{ij} = J · q_i · q_j                (correct species + correct type)
+        ΔG_{ij} = φ · J · q_i · q_j            (correct species, wrong type)
+        ΔG_{ij} = 0                             (wrong species — no interaction)
+
+    allowed_mask is True wherever an interaction is permitted (correct species
+    pair, any type).  It is a superset of correct_mask.
 
     If monomer_entropy is provided, an additive conformational-entropy
     penalty is included:
 
         ΔG_{ij} += s_i + s_j
-
-    where s_i is the entropy cost (kT) of monomer i losing conformational
-    freedom upon dimerisation.  This term is symmetric in i,j, ensuring
-    detailed balance is preserved (the Boltzmann factor exp(-β·ΔG) is
-    still the unique equilibrium ratio [X_i X_j]/([X_i][X_j])).
 
     monomer_entropy : jax array, shape () (scalar, shared) or (n,) (per-monomer)
                       Constrained to [0, S_max].  Ignored when None.
@@ -45,7 +49,11 @@ def interaction_energy_matrix(charges, correct_mask, phi, J,
     qi = charges[:, None]
     qj = charges[None, :]
     V  = J * qi * qj
-    dG = jnp.where(correct_mask, V, phi * V)
+    if allowed_mask is None:
+        dG = jnp.where(correct_mask, V, phi * V)
+    else:
+        # Correct pair: full V; allowed-but-wrong-type: phi*V; forbidden: 0
+        dG = jnp.where(correct_mask, V, jnp.where(allowed_mask, phi * V, 0.0))
 
     if monomer_entropy is not None:
         n  = charges.shape[0]

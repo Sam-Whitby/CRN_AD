@@ -136,9 +136,10 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     p = constrain_params(raw_params,
                          J_max=static['J_max'],
                          S_max=static.get('S_max', 0.0))
-    mono_s = _get_monomer_entropy(p)
-    sw     = float(static.get('smooth_width', 0.0))
-    T      = static.get('T', 1)
+    mono_s       = _get_monomer_entropy(p)
+    sw           = float(static.get('smooth_width', 0.0))
+    T            = static.get('T', 1)
+    allowed_mask = static.get('allowed_mask', None)
     # Expand species-level pKa (n_species,) → particle-level (N,)
     pKa_full = jnp.repeat(p['pKa'], T) if T > 1 else p['pKa']
     # Expand per-species entropy (n_species,) → (N,) when T > 1
@@ -155,6 +156,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
         smooth_width=sw,
         monomer_entropy=mono_s,
         ph_initial=7.0,
+        allowed_mask=allowed_mask,
     )
 
     def score_one(pH_sched):
@@ -168,6 +170,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
             smooth_width=sw,
             monomer_entropy=mono_s,
             ph_initial=7.0,
+            allowed_mask=allowed_mask,
         )
         return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
@@ -194,11 +197,12 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     initial_state = make_initial_state(static['n'])
     sw            = float(static.get('smooth_width', 0.0))
 
-    T      = static.get('T', 1)
-    pKa    = jnp.array(p_constrained['pKa'])
-    pKa    = jnp.repeat(pKa, T) if T > 1 else pKa
-    phi    = jnp.array(p_constrained['phi'])
-    J      = jnp.array(p_constrained['J'])
+    T            = static.get('T', 1)
+    allowed_mask = static.get('allowed_mask', None)
+    pKa          = jnp.array(p_constrained['pKa'])
+    pKa          = jnp.repeat(pKa, T) if T > 1 else pKa
+    phi          = jnp.array(p_constrained['phi'])
+    J            = jnp.array(p_constrained['J'])
     mono_s = (_get_monomer_entropy(p_constrained)
               if p_constrained.get('monomer_entropy') is not None else None)
     if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
@@ -217,6 +221,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
             smooth_width=sw,
             monomer_entropy=mono_s,
             ph_initial=7.0,
+            allowed_mask=allowed_mask,
         )
 
         def score_one(pH_sched):
@@ -229,6 +234,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                 n_points=static['n_points_sim'],
                 smooth_width=sw,
                 monomer_entropy=mono_s,
+                allowed_mask=allowed_mask,
             )
             return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
@@ -274,6 +280,7 @@ def train(config):
     S_max          = float(config.get('S_max', 0.0))
     smooth         = float(config.get('smooth_width', 0.0))
     per_mono       = bool(config.get('per_monomer_entropy', False))
+    specific_bonds = bool(config.get('specific_bonds', False))
 
     # ------------------------------------------------------------------
     # Static quantities
@@ -290,33 +297,49 @@ def train(config):
             correct_mask_np[i, j] = True
             correct_mask_np[j, i] = True
 
+    # Species-pair mask: correct species pair, any type (superset of correct_mask)
+    # Used with --specific_bonds to zero out cross-species and homodimer interactions
+    species_pair_mask_np = np.zeros((N, N), dtype=bool)
+    for pair_idx in range(n_species // 2):
+        for t1 in range(T):
+            for t2 in range(T):
+                i = 2 * pair_idx * T + t1
+                j = (2 * pair_idx + 1) * T + t2
+                species_pair_mask_np[i, j] = True
+                species_pair_mask_np[j, i] = True
+
     i_idx, j_idx = make_triu_indices(N)
     correct_triu_idx = np.array([
         pos for pos, (ii, jj) in enumerate(zip(i_idx, j_idx))
         if correct_mask_np[ii, jj]
     ])
 
+    allowed_mask_jax = jnp.array(species_pair_mask_np) if specific_bonds else None
+
     static = {
-        'n'               : N,
-        'n_species'       : n_species,
-        'T'               : T,
-        'acid_base'       : jnp.array(acid_base_np),
-        'acid_base_np'    : acid_base_np,
-        'correct_mask'    : jnp.array(correct_mask_np),
-        'correct_mask_np' : correct_mask_np,
-        'i_idx'           : i_idx,
-        'j_idx'           : j_idx,
-        'correct_triu_idx': jnp.array(correct_triu_idx),
-        'beta'            : float(config.get('beta', 1.0)),
-        'k0'              : float(config.get('k0',  1.0)),
-        'n_points_sim'    : int(config.get('n_points_sim',   40)),
-        'n_points_equil'  : int(config.get('n_points_equil', 60)),
-        'equil_duration'  : float(config.get('equil_duration', 80.0)),
-        'tau'             : float(config.get('tau', 5.0)),
-        'J_max'           : J_max,
-        'S_max'           : S_max,
-        'smooth_width'    : smooth,
+        'n'                  : N,
+        'n_species'          : n_species,
+        'T'                  : T,
+        'acid_base'          : jnp.array(acid_base_np),
+        'acid_base_np'       : acid_base_np,
+        'correct_mask'       : jnp.array(correct_mask_np),
+        'correct_mask_np'    : correct_mask_np,
+        'species_pair_mask_np': species_pair_mask_np,
+        'i_idx'              : i_idx,
+        'j_idx'              : j_idx,
+        'correct_triu_idx'   : jnp.array(correct_triu_idx),
+        'beta'               : float(config.get('beta', 1.0)),
+        'k0'                 : float(config.get('k0',  1.0)),
+        'n_points_sim'       : int(config.get('n_points_sim',   40)),
+        'n_points_equil'     : int(config.get('n_points_equil', 60)),
+        'equil_duration'     : float(config.get('equil_duration', 80.0)),
+        'tau'                : float(config.get('tau', 5.0)),
+        'J_max'              : J_max,
+        'S_max'              : S_max,
+        'smooth_width'       : smooth,
         'per_monomer_entropy': per_mono,
+        'specific_bonds'     : specific_bonds,
+        'allowed_mask'       : allowed_mask_jax,
     }
 
     # ------------------------------------------------------------------
@@ -481,6 +504,7 @@ def train(config):
         static['correct_mask'], static['n'], static['i_idx'], static['j_idx'],
         n_points=static['n_points_equil'],
         smooth_width=smooth, monomer_entropy=mono_s, ph_initial=7.0,
+        allowed_mask=allowed_mask_jax,
     )
 
     return (raw_params, loss_history, score_history, param_history,

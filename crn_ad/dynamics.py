@@ -46,14 +46,15 @@ def make_initial_state(n):
 def crn_ode(state, t,
             pKa, acid_base, phi, J, beta, k0, pH,
             correct_mask, n, i_idx, j_idx,
-            monomer_entropy=None):
+            monomer_entropy=None, allowed_mask=None):
     """CRN ODE right-hand side."""
     free       = jnp.maximum(state[:n], 0.0)
     dimer_triu = jnp.maximum(state[n:], 0.0)
 
     charges    = henderson_hasselbalch(pKa, pH, acid_base)
     dG         = interaction_energy_matrix(charges, correct_mask, phi, J,
-                                           monomer_entropy=monomer_entropy)
+                                           monomer_entropy=monomer_entropy,
+                                           allowed_mask=allowed_mask)
     kf         = forward_rate_matrix(dG, beta, k0)
     dimer_full = triu_to_full(dimer_triu, n, i_idx, j_idx)
     flux       = kf * jnp.outer(free, free) - k0 * dimer_full
@@ -66,11 +67,12 @@ def crn_ode(state, t,
 def simulate_segment(state, pH, duration,
                      pKa, acid_base, phi, J, beta, k0,
                      correct_mask, n, i_idx, j_idx,
-                     n_points=60, monomer_entropy=None):
+                     n_points=60, monomer_entropy=None, allowed_mask=None):
     t_span = jnp.linspace(0.0, float(duration), n_points)
     ode_fn = lambda s, t, _pKa, _phi, _J: crn_ode(
         s, t, _pKa, acid_base, _phi, _J,
-        beta, k0, pH, correct_mask, n, i_idx, j_idx, monomer_entropy)
+        beta, k0, pH, correct_mask, n, i_idx, j_idx,
+        monomer_entropy, allowed_mask)
     traj = odeint(ode_fn, state, t_span, pKa, phi, J,
                   rtol=1e-4, atol=1e-6, mxstep=1000)
     return traj[-1], traj
@@ -79,14 +81,15 @@ def simulate_segment(state, pH, duration,
 def simulate_schedule(initial_state, pH_schedule, duration_per_seg,
                       pKa, acid_base, phi, J, beta, k0,
                       correct_mask, n, i_idx, j_idx,
-                      n_points=60, monomer_entropy=None):
+                      n_points=60, monomer_entropy=None, allowed_mask=None):
     """Python-loop simulation — use for visualisation only (not inside JIT)."""
     state, traj_list = initial_state, []
     for pH in pH_schedule:
         state, traj = simulate_segment(
             state, float(pH), duration_per_seg,
             pKa, acid_base, phi, J, beta, k0,
-            correct_mask, n, i_idx, j_idx, n_points, monomer_entropy)
+            correct_mask, n, i_idx, j_idx, n_points,
+            monomer_entropy, allowed_mask)
         traj_list.append(traj)
     return state, traj_list
 
@@ -98,7 +101,8 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                            n_points=40,
                            smooth_width=0.0,
                            monomer_entropy=None,
-                           ph_initial=None):
+                           ph_initial=None,
+                           allowed_mask=None):
     """
     Scan-based simulation — O(1) JAX graph via lax.scan + vmap.
 
@@ -107,6 +111,8 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
     ph_initial   : pH before this schedule (used for the first segment's
                    ramp when smooth_width > 0).  Defaults to pH_schedule[0]
                    (no ramp on first segment).
+    allowed_mask : if not None, pairs outside this mask have ΔG=0
+                   (used with --specific_bonds).
     """
     t_span = jnp.linspace(0.0, float(duration_per_seg), n_points)
 
@@ -122,7 +128,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                 pH    = _pH_prev + (_pH_target - _pH_prev) * blend
                 return crn_ode(s, t, _pKa, acid_base, _phi, _J,
                                beta, k0, pH, correct_mask, n, i_idx, j_idx,
-                               monomer_entropy)
+                               monomer_entropy, allowed_mask)
 
             traj = odeint(ode_fn, state, t_span,
                           pKa, phi, J, pH_prev, pH_target,
@@ -137,7 +143,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
             def ode_fn(s, t, _pKa, _phi, _J):
                 return crn_ode(s, t, _pKa, acid_base, _phi, _J,
                                beta, k0, pH, correct_mask, n, i_idx, j_idx,
-                               monomer_entropy)
+                               monomer_entropy, allowed_mask)
             traj = odeint(ode_fn, state, t_span, pKa, phi, J,
                           rtol=1e-4, atol=1e-6, mxstep=1000)
             return traj[-1], None

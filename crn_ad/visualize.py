@@ -50,6 +50,19 @@ _TAB20B = plt.cm.tab20b(np.linspace(0, 1, 20))
 _TAB20C = plt.cm.tab20c(np.linspace(0, 1, 20))
 _PALETTE = np.concatenate([_TAB20B, _TAB20C], axis=0)
 
+# Visually distinct colors for correct dimers — consistent across all panels
+_CORRECT_DIMER_COLORS = [
+    '#e74c3c', '#3498db', '#2ecc71', '#f39c12',
+    '#9b59b6', '#1abc9c', '#e67e22', '#34495e',
+    '#c0392b', '#2980b9', '#27ae60', '#8e44ad',
+    '#16a085', '#d35400', '#7f8c8d', '#2c3e50',
+]
+
+
+def _correct_dimer_color(correct_idx):
+    """Color for the correct_idx-th correct dimer (0-based)."""
+    return _CORRECT_DIMER_COLORS[correct_idx % len(_CORRECT_DIMER_COLORS)]
+
 
 def _species_color(i):
     return _PALETTE[i % len(_PALETTE)]
@@ -414,30 +427,24 @@ def plot_summary(loss_history, score_history, param_history,
     ax_conc.set_yscale('symlog', linthresh=1e-3, linscale=0.4)
     ax_conc.yaxis.set_minor_formatter(ticker.NullFormatter())
 
-    # Free monomers
-    for i in range(n):
-        ax_conc.plot(t_all, all_st[:, i],
-                     color=_species_color(i),
-                     linestyle=ls_cycle[i % len(ls_cycle)],
-                     linewidth=2.0,
-                     label=f'[{plabels[i]}]')
-
-    # All dimers (homodimers included)
+    # Correct dimers only — with distinct colors consistent across all panels
+    correct_count = 0
     for k in range(n_triu):
         ii, jj = int(i_idx[k]), int(j_idx[k])
-        col = _dimer_color(ii, jj, n, correct_mask_np, T)
-        lw  = 2.0 if correct_mask_np[ii, jj] else 0.8
+        if not correct_mask_np[ii, jj]:
+            continue
+        col = _correct_dimer_color(correct_count)
         ax_conc.plot(t_all, all_st[:, n + k],
                      color=col,
-                     linestyle=ls_cycle[k % len(ls_cycle)],
-                     linewidth=lw,
-                     label=f'[{plabels[ii]}–{plabels[jj]}]',
-                     alpha=0.95 if correct_mask_np[ii, jj] else 0.45)
+                     linestyle=ls_cycle[correct_count % len(ls_cycle)],
+                     linewidth=2.2,
+                     label=f'[{plabels[ii]}–{plabels[jj]}] ✓')
+        correct_count += 1
 
-    # Mass conservation
+    # Total monomer content M(t) ≡ 1
     M_t = all_st[:, :n].sum(1) + 2.0 * all_st[:, n:].sum(1)
     ax_conc.plot(t_all, M_t, 'k--', linewidth=2.0,
-                 label='M(t) = Σ[Xᵢ]+2Σ[XᵢXⱼ] (≡1)')
+                 label='M(t) total (≡1)')
 
     # Segment shading
     seg_colors = ['#2980b9', '#27ae60', '#c0392b', '#8e44ad', '#d35400']
@@ -485,25 +492,38 @@ def plot_summary(loss_history, score_history, param_history,
     if mono_arr is not None and len(mono_arr) > 1 and T > 1:
         mono_arr = np.repeat(mono_arr, T)
 
+    specific_bonds    = static.get('specific_bonds', False)
+    species_pair_mask = static.get('species_pair_mask_np', None)
+
+    correct_count_dG = 0
     for k in range(n_triu):
         ii, jj = int(i_idx[k]), int(j_idx[k])
+        # Skip pairs with zero interaction (forbidden by --specific_bonds)
+        if specific_bonds and species_pair_mask is not None:
+            if not species_pair_mask[ii, jj]:
+                continue
+        is_correct = bool(correct_mask_np[ii, jj])
+        phi_fac = 1.0 if is_correct else phi
         qs = np.array([
             float(henderson_hasselbalch(jnp.array(pKa_full), ph, jnp.array(acid_base))[ii]) *
             float(henderson_hasselbalch(jnp.array(pKa_full), ph, jnp.array(acid_base))[jj])
             for ph in pHs
         ])
-        phi_fac = 1.0 if correct_mask_np[ii, jj] else phi
         dG_line = J * phi_fac * qs
         if mono_arr is not None:
             si = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[ii])
             sj = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[jj])
             dG_line = dG_line + si + sj
-        col = _dimer_color(ii, jj, n, correct_mask_np, T)
-        lw  = 2.0 if correct_mask_np[ii, jj] else 0.9
-        ls  = '-' if correct_mask_np[ii, jj] else '--'
-        lbl = f'{plabels[ii]}–{plabels[jj]}'
-        ax_dG.plot(pHs, dG_line, color=col, linewidth=lw, linestyle=ls,
-                   label=lbl + (' ✓' if correct_mask_np[ii, jj] else ''))
+        if is_correct:
+            col = _correct_dimer_color(correct_count_dG)
+            lw, ls = 2.2, '-'
+            lbl = f'{plabels[ii]}–{plabels[jj]} ✓'
+            correct_count_dG += 1
+        else:
+            col = '#aaaaaa'
+            lw, ls = 0.9, '--'
+            lbl = f'{plabels[ii]}–{plabels[jj]}'
+        ax_dG.plot(pHs, dG_line, color=col, linewidth=lw, linestyle=ls, label=lbl)
     ax_dG.axhline(0, color='black', linewidth=0.7)
     for pH_v in pH_schedule:
         ax_dG.axvline(pH_v, color='#e74c3c', linewidth=0.9, linestyle=':', alpha=0.7)
