@@ -18,6 +18,17 @@ import jax.numpy as jnp
 
 SPECIES_NAMES = list(string.ascii_uppercase)
 
+
+def _particle_labels(n_species, T):
+    """Return labels for all N = n_species*T particles.
+
+    T=1: ['A', 'B', 'C', ...]
+    T>1: ['A1', 'A2', 'B1', 'B2', ...]
+    """
+    if T == 1:
+        return [SPECIES_NAMES[s] for s in range(n_species)]
+    return [f'{SPECIES_NAMES[s]}{t + 1}' for s in range(n_species) for t in range(T)]
+
 _CMAP_CHARGE = plt.cm.RdBu_r
 _NORM_CHARGE = Normalize(vmin=-1.0, vmax=1.0)
 
@@ -44,10 +55,11 @@ def _species_color(i):
     return _PALETTE[i % len(_PALETTE)]
 
 
-def _dimer_color(ii, jj, n, correct_mask_np):
+def _dimer_color(ii, jj, n, correct_mask_np, T=1):
     if correct_mask_np[ii, jj]:
         greens = ['#27ae60', '#1abc9c', '#2ecc71', '#16a085', '#0e6655']
-        return greens[(min(ii, jj) // 2) % len(greens)]
+        pair_idx = min(ii, jj) // (2 * T)  # species pair index (robust to T>1)
+        return greens[pair_idx % len(greens)]
     else:
         greys = ['#7f8c8d', '#95a5a6', '#bdc3c7', '#a04000',
                  '#784212', '#6e2f1a', '#717d7e', '#808b96']
@@ -86,20 +98,24 @@ def _ph_trace(t_arr, equil_duration, pH_schedule, duration_per_seg, smooth_width
 # ---------------------------------------------------------------------------
 
 def plot_final_concentrations(state, n, acid_base, correct_mask_np,
-                               title='', save_path=None):
+                               title='', save_path=None,
+                               n_species=None, T=1):
     from .dynamics import make_triu_indices
+    if n_species is None:
+        n_species = n
+    plabels  = _particle_labels(n_species, T)
     i_idx, j_idx = make_triu_indices(n)
     free       = np.array(state[:n])
     dimer_triu = np.array(state[n:])
     labels, values, colors = [], [], []
     for i in range(n):
-        labels.append(SPECIES_NAMES[i])
+        labels.append(plabels[i])
         values.append(free[i])
         colors.append(_species_color(i))
     for k, (ii, jj) in enumerate(zip(i_idx, j_idx)):
-        labels.append(f'{SPECIES_NAMES[ii]}–{SPECIES_NAMES[jj]}')
+        labels.append(f'{plabels[ii]}–{plabels[jj]}')
         values.append(dimer_triu[k])
-        colors.append(_dimer_color(ii, jj, n, correct_mask_np))
+        colors.append(_dimer_color(ii, jj, n, correct_mask_np, T))
     fig, ax = plt.subplots(figsize=(max(10, len(labels) * 0.55), 4.5))
     xs = np.arange(len(labels))
     ax.bar(xs, values, color=colors, edgecolor='white', linewidth=0.5)
@@ -120,8 +136,12 @@ def plot_final_concentrations(state, n, acid_base, correct_mask_np,
 
 def animate_crn(traj_list, n, acid_base, correct_mask_np,
                 pH_schedule, duration_per_seg,
-                pKa_visual=None, output_path='animation.gif', fps=15):
+                pKa_visual=None, output_path='animation.gif', fps=15,
+                n_species=None, T=1):
     from .dynamics import make_triu_indices
+    if n_species is None:
+        n_species = n
+    plabels  = _particle_labels(n_species, T)
     i_idx, j_idx = make_triu_indices(n)
     pos          = _node_positions(n)
     all_states   = np.concatenate([np.array(tr) for tr in traj_list], axis=0)
@@ -171,7 +191,7 @@ def animate_crn(traj_list, n, acid_base, correct_mask_np,
         circ = plt.Circle(pos[i], 0.13, zorder=3, linewidth=1.5, edgecolor='white')
         ax_net.add_patch(circ)
         node_circles.append(circ)
-        ax_net.text(pos[i, 0], pos[i, 1], SPECIES_NAMES[i],
+        ax_net.text(pos[i, 0], pos[i, 1], plabels[i],
                     ha='center', va='center', fontsize=11,
                     fontweight='bold', color='white', zorder=4)
 
@@ -194,12 +214,12 @@ def animate_crn(traj_list, n, acid_base, correct_mask_np,
     conc_lines = []
     for i in range(n):
         ln, = ax_conc.plot([], [], '-', color=_species_color(i), linewidth=1.8,
-                           label=f'[{SPECIES_NAMES[i]}]', alpha=0.9)
+                           label=f'[{plabels[i]}]', alpha=0.9)
         conc_lines.append(ln)
     for k, (ii, jj) in enumerate(zip(i_idx, j_idx)):
-        col = _dimer_color(ii, jj, n, correct_mask_np)
+        col = _dimer_color(ii, jj, n, correct_mask_np, T)
         lw  = 2.0 if correct_mask_np[ii, jj] else 0.7
-        lbl = f'[{SPECIES_NAMES[ii]}–{SPECIES_NAMES[jj]}]' if correct_mask_np[ii, jj] else None
+        lbl = f'[{plabels[ii]}–{plabels[jj]}]' if correct_mask_np[ii, jj] else None
         ln, = ax_conc.plot([], [], '-', color=col, linewidth=lw, label=lbl,
                            alpha=0.85 if lbl else 0.4)
         conc_lines.append(ln)
@@ -286,10 +306,14 @@ def plot_summary(loss_history, score_history, param_history,
       before bar chart: entropy history (wide)
     """
     n               = static['n']
+    n_species       = static.get('n_species', n)
+    T               = static.get('T', 1)
+    plabels         = _particle_labels(n_species, T)
     i_idx, j_idx    = static['i_idx'], static['j_idx']
     correct_mask_np = static['correct_mask_np']
     acid_base       = np.array(static['acid_base'])
-    pKa             = np.array(trained_params['pKa'])
+    pKa             = np.array(trained_params['pKa'])          # shape (n_species,)
+    pKa_full        = np.repeat(pKa, T) if T > 1 else pKa      # shape (N,)
     phi             = float(trained_params['phi'])
     J               = float(trained_params['J'])
     S_max           = float(static.get('S_max', 0.0))
@@ -339,10 +363,10 @@ def plot_summary(loss_history, score_history, param_history,
     ax_loss.grid(alpha=0.25)
 
     # -------------------------------------------------------------------
-    # Panel 2 — pKa evolution
+    # Panel 2 — pKa evolution  (one curve per species, shared across types)
     # -------------------------------------------------------------------
-    for i in range(n):
-        ab = 'base' if acid_base[i] == 1 else 'acid'
+    for i in range(n_species):
+        ab = 'base' if acid_base[i * T] == 1 else 'acid'
         ax_pka.plot(epochs, pKa_hist[:, i],
                     color=_species_color(i),
                     linestyle=ls_cycle[i % len(ls_cycle)],
@@ -396,18 +420,18 @@ def plot_summary(loss_history, score_history, param_history,
                      color=_species_color(i),
                      linestyle=ls_cycle[i % len(ls_cycle)],
                      linewidth=2.0,
-                     label=f'[{SPECIES_NAMES[i]}]')
+                     label=f'[{plabels[i]}]')
 
     # All dimers (homodimers included)
     for k in range(n_triu):
         ii, jj = int(i_idx[k]), int(j_idx[k])
-        col = _dimer_color(ii, jj, n, correct_mask_np)
+        col = _dimer_color(ii, jj, n, correct_mask_np, T)
         lw  = 2.0 if correct_mask_np[ii, jj] else 0.8
         ax_conc.plot(t_all, all_st[:, n + k],
                      color=col,
                      linestyle=ls_cycle[k % len(ls_cycle)],
                      linewidth=lw,
-                     label=f'[{SPECIES_NAMES[ii]}–{SPECIES_NAMES[jj]}]',
+                     label=f'[{plabels[ii]}–{plabels[jj]}]',
                      alpha=0.95 if correct_mask_np[ii, jj] else 0.45)
 
     # Mass conservation
@@ -457,12 +481,15 @@ def plot_summary(loss_history, score_history, param_history,
     pHs = np.linspace(2, 12, 300)
     mono_entropy = trained_params.get('monomer_entropy', None)
     mono_arr     = (np.array(mono_entropy) if mono_entropy is not None else None)
+    # Expand per-species entropy to per-particle for index lookup by ii/jj
+    if mono_arr is not None and len(mono_arr) > 1 and T > 1:
+        mono_arr = np.repeat(mono_arr, T)
 
     for k in range(n_triu):
         ii, jj = int(i_idx[k]), int(j_idx[k])
         qs = np.array([
-            float(henderson_hasselbalch(jnp.array(pKa), ph, jnp.array(acid_base))[ii]) *
-            float(henderson_hasselbalch(jnp.array(pKa), ph, jnp.array(acid_base))[jj])
+            float(henderson_hasselbalch(jnp.array(pKa_full), ph, jnp.array(acid_base))[ii]) *
+            float(henderson_hasselbalch(jnp.array(pKa_full), ph, jnp.array(acid_base))[jj])
             for ph in pHs
         ])
         phi_fac = 1.0 if correct_mask_np[ii, jj] else phi
@@ -471,10 +498,10 @@ def plot_summary(loss_history, score_history, param_history,
             si = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[ii])
             sj = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[jj])
             dG_line = dG_line + si + sj
-        col = _dimer_color(ii, jj, n, correct_mask_np)
+        col = _dimer_color(ii, jj, n, correct_mask_np, T)
         lw  = 2.0 if correct_mask_np[ii, jj] else 0.9
         ls  = '-' if correct_mask_np[ii, jj] else '--'
-        lbl = f'{SPECIES_NAMES[ii]}–{SPECIES_NAMES[jj]}'
+        lbl = f'{plabels[ii]}–{plabels[jj]}'
         ax_dG.plot(pHs, dG_line, color=col, linewidth=lw, linestyle=ls,
                    label=lbl + (' ✓' if correct_mask_np[ii, jj] else ''))
     ax_dG.axhline(0, color='black', linewidth=0.7)
@@ -500,7 +527,7 @@ def plot_summary(loss_history, score_history, param_history,
         ax_ent.set_xlabel('Epoch', fontsize=11)
         ax_ent.set_ylabel('Monomer entropy  s  (kT)', fontsize=11)
         ax_ent.set_title(f'Conformational entropy parameters (max {S_max:.1f} kT)', fontsize=12)
-        ax_ent.legend(fontsize=8, loc='best', ncol=max(1, n // 4))
+        ax_ent.legend(fontsize=8, loc='best', ncol=max(1, n_species // 4))
         ax_ent.grid(alpha=0.25)
 
     # -------------------------------------------------------------------

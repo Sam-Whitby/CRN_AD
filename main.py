@@ -53,7 +53,11 @@ def build_parser():
     )
     p.add_argument('--mode', choices=['train', 'animate', 'both'], default='train')
     p.add_argument('--n_species', type=int, default=4,
-                   help='Number of species (even, max 10).')
+                   help='Number of species types (even). E.g. 4 → A,B,C,D.')
+    p.add_argument('--n_types', type=int, default=1,
+                   help='Number of types per species (T). With T>1 species X '
+                        'becomes X1…XT. Correct bonds are Ai-Bi for matching type. '
+                        'All types of a species share the same pKa.')
     p.add_argument('--target_pH', nargs='+', type=float, default=[9.0, 5.0, 7.0],
                    help='Target pH schedule, one value per segment.')
     p.add_argument('--duration', type=float, default=30.0,
@@ -113,22 +117,27 @@ def open_file(path):
         pass
 
 
-def _static_dict(n, beta, k0, n_points_sim, n_points_equil,
+def _static_dict(n_species, T, beta, k0, n_points_sim, n_points_equil,
                  equil_duration, tau, J_max, S_max, smooth_width,
                  per_monomer_entropy=False):
-    acid_base_np    = np.array([i % 2 for i in range(n)], dtype=int)
-    correct_mask_np = np.zeros((n, n), dtype=bool)
-    for k in range(n // 2):
-        i, j = 2 * k, 2 * k + 1
-        correct_mask_np[i, j] = True
-        correct_mask_np[j, i] = True
-    i_idx, j_idx = make_triu_indices(n)
+    N = n_species * T
+    acid_base_np    = np.array([(k // T) % 2 for k in range(N)], dtype=int)
+    correct_mask_np = np.zeros((N, N), dtype=bool)
+    for pair_idx in range(n_species // 2):
+        for t in range(T):
+            i = 2 * pair_idx * T + t
+            j = (2 * pair_idx + 1) * T + t
+            correct_mask_np[i, j] = True
+            correct_mask_np[j, i] = True
+    i_idx, j_idx = make_triu_indices(N)
     correct_triu_idx = np.array([
         pos for pos, (ii, jj) in enumerate(zip(i_idx, j_idx))
         if correct_mask_np[ii, jj]
     ])
     return {
-        'n'               : n,
+        'n'               : N,
+        'n_species'       : n_species,
+        'T'               : T,
         'acid_base'       : jnp.array(acid_base_np),
         'acid_base_np'    : acid_base_np,
         'correct_mask'    : jnp.array(correct_mask_np),
@@ -152,11 +161,18 @@ def _static_dict(n, beta, k0, n_points_sim, n_points_equil,
 def get_equil_and_schedule_traj(p, static, target_sched, duration):
     """Run pH-7 equilibration then target schedule; return trajectories."""
     n      = static['n']
+    T      = static.get('T', 1)
     mono_s = _get_mono(p, static)
+
+    # Expand species-level pKa (n_species,) → particle-level (N,)
+    pKa_arr  = jnp.array(p['pKa'])
+    pKa_full = jnp.repeat(pKa_arr, T) if T > 1 else pKa_arr
+    if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
+        mono_s = jnp.repeat(mono_s, T)
 
     equil_final, equil_traj = simulate_schedule(
         make_initial_state(n), [7.0], static['equil_duration'],
-        jnp.array(p['pKa']), static['acid_base'],
+        pKa_full, static['acid_base'],
         jnp.array(p['phi']), jnp.array(p['J']),
         static['beta'], static['k0'],
         static['correct_mask'], n, static['i_idx'], static['j_idx'],
@@ -166,7 +182,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
 
     final_state, schedule_trajs = simulate_schedule(
         equil_final, target_sched, duration,
-        jnp.array(p['pKa']), static['acid_base'],
+        pKa_full, static['acid_base'],
         jnp.array(p['phi']), jnp.array(p['J']),
         static['beta'], static['k0'],
         static['correct_mask'], n, static['i_idx'], static['j_idx'],
@@ -201,6 +217,7 @@ def main():
     if args.mode in ('train', 'both'):
         config = dict(
             n_species            = args.n_species,
+            n_types              = args.n_types,
             target_pH_schedule   = args.target_pH,
             duration_per_seg     = args.duration,
             equil_duration       = args.equil_duration,
@@ -232,6 +249,7 @@ def main():
         # Save params
         params_out = {
             'n_species'         : args.n_species,
+            'n_types'           : args.n_types,
             'target_pH_schedule': args.target_pH,
             'pKa'               : p_eval['pKa'].tolist(),
             'phi'               : float(p_eval['phi']),
@@ -251,8 +269,9 @@ def main():
         print(f'Saved trained params → {params_path}')
 
         print('\n— Trained parameters —')
+        T_val = args.n_types
         for i in range(args.n_species):
-            ab = 'base' if int(static['acid_base'][i]) == 1 else 'acid'
+            ab = 'base' if int(static['acid_base'][i * T_val]) == 1 else 'acid'
             print(f'  {SPECIES_NAMES[i]} ({ab:<4s}): pKa = {float(p_eval["pKa"][i]):.3f}')
         print(f'  φ = {float(p_eval["phi"]):.4f}')
         print(f'  J = {float(p_eval["J"]):.4f}  kT')
@@ -278,8 +297,9 @@ def main():
         _J_max  = float(pdata.get('J_max', args.J_max))
         _S_max  = float(pdata.get('S_max', args.S_max))
         _permon = bool(pdata.get('per_monomer_entropy', False))
+        _T      = int(pdata.get('n_types', 1))
         static = _static_dict(
-            pdata['n_species'],
+            pdata['n_species'], _T,
             pdata['beta'], pdata['k0'],
             args.n_points_sim, args.n_points_equil,
             args.equil_duration, args.tau,
@@ -349,8 +369,12 @@ def main():
     if args.animate or args.mode == 'both':
         print('\nGenerating animations ...')
         n               = static['n']
+        T_val           = static.get('T', 1)
         acid_base_np    = static['acid_base_np']
         correct_mask_np = static['correct_mask_np']
+        # pKa for animation: expand from n_species to N particles
+        pKa_vis = np.array(p_eval['pKa'])
+        pKa_vis = np.repeat(pKa_vis, T_val) if T_val > 1 else pKa_vis
 
         for s_idx, sched in enumerate(
                 [all_schedules[target_idx]] +
@@ -363,7 +387,7 @@ def main():
                 animate_crn(
                     [equil_t] + sched_trajs, n, acid_base_np, correct_mask_np,
                     [7.0] + list(sched), args.duration,
-                    pKa_visual=p_eval['pKa'],
+                    pKa_visual=pKa_vis,
                     output_path=gif, fps=12,
                 )
             except Exception as exc:

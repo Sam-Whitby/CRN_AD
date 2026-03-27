@@ -138,10 +138,16 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                          S_max=static.get('S_max', 0.0))
     mono_s = _get_monomer_entropy(p)
     sw     = float(static.get('smooth_width', 0.0))
+    T      = static.get('T', 1)
+    # Expand species-level pKa (n_species,) → particle-level (N,)
+    pKa_full = jnp.repeat(p['pKa'], T) if T > 1 else p['pKa']
+    # Expand per-species entropy (n_species,) → (N,) when T > 1
+    if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
+        mono_s = jnp.repeat(mono_s, T)
 
     equil_state = simulate_schedule_scan(
         initial_state, jnp.array([7.0]), static['equil_duration'],
-        p['pKa'], static['acid_base'], p['phi'], p['J'],
+        pKa_full, static['acid_base'], p['phi'], p['J'],
         static['beta'], static['k0'],
         static['correct_mask'], static['n'],
         static['i_idx'], static['j_idx'],
@@ -154,7 +160,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     def score_one(pH_sched):
         final = simulate_schedule_scan(
             equil_state, pH_sched, duration_per_seg,
-            p['pKa'], static['acid_base'], p['phi'], p['J'],
+            pKa_full, static['acid_base'], p['phi'], p['J'],
             static['beta'], static['k0'],
             static['correct_mask'], static['n'],
             static['i_idx'], static['j_idx'],
@@ -188,11 +194,15 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     initial_state = make_initial_state(static['n'])
     sw            = float(static.get('smooth_width', 0.0))
 
-    pKa   = jnp.array(p_constrained['pKa'])
-    phi   = jnp.array(p_constrained['phi'])
-    J     = jnp.array(p_constrained['J'])
+    T      = static.get('T', 1)
+    pKa    = jnp.array(p_constrained['pKa'])
+    pKa    = jnp.repeat(pKa, T) if T > 1 else pKa
+    phi    = jnp.array(p_constrained['phi'])
+    J      = jnp.array(p_constrained['J'])
     mono_s = (_get_monomer_entropy(p_constrained)
               if p_constrained.get('monomer_entropy') is not None else None)
+    if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
+        mono_s = jnp.repeat(mono_s, T)
 
     # JIT-compiled scoring function (traced once, cached by JAX)
     @jax.jit
@@ -254,8 +264,11 @@ def train(config):
     seed               : int
     (NaN: training stops at the last finite epoch; report is always generated)
     """
-    n = config['n_species']
-    assert n % 2 == 0 and 2 <= n <= 10
+    n_species = config['n_species']
+    assert n_species % 2 == 0 and n_species >= 2
+    T = int(config.get('n_types', 1))
+    assert T >= 1
+    N = n_species * T  # total particle count
 
     J_max          = float(config.get('J_max', 3.5))
     S_max          = float(config.get('S_max', 0.0))
@@ -265,21 +278,28 @@ def train(config):
     # ------------------------------------------------------------------
     # Static quantities
     # ------------------------------------------------------------------
-    acid_base_np    = np.array([i % 2 for i in range(n)], dtype=int)
-    correct_mask_np = np.zeros((n, n), dtype=bool)
-    for k in range(n // 2):
-        i, j = 2 * k, 2 * k + 1
-        correct_mask_np[i, j] = True
-        correct_mask_np[j, i] = True
+    # Particle k: species s = k // T, type t = k % T
+    # acid if s is even, base if s is odd
+    acid_base_np    = np.array([(k // T) % 2 for k in range(N)], dtype=int)
+    # Correct bond: same species pair (A-B, C-D, ...) AND same type index
+    correct_mask_np = np.zeros((N, N), dtype=bool)
+    for pair_idx in range(n_species // 2):
+        for t in range(T):
+            i = 2 * pair_idx * T + t
+            j = (2 * pair_idx + 1) * T + t
+            correct_mask_np[i, j] = True
+            correct_mask_np[j, i] = True
 
-    i_idx, j_idx = make_triu_indices(n)
+    i_idx, j_idx = make_triu_indices(N)
     correct_triu_idx = np.array([
         pos for pos, (ii, jj) in enumerate(zip(i_idx, j_idx))
         if correct_mask_np[ii, jj]
     ])
 
     static = {
-        'n'               : n,
+        'n'               : N,
+        'n_species'       : n_species,
+        'T'               : T,
         'acid_base'       : jnp.array(acid_base_np),
         'acid_base_np'    : acid_base_np,
         'correct_mask'    : jnp.array(correct_mask_np),
@@ -308,27 +328,29 @@ def train(config):
     duration      = float(config['duration_per_seg'])
     all_pH_array  = jnp.array(all_schedules, dtype=float)
 
-    n_entropy = n if per_mono else 1
-    print(f"Species      : {n}  ({n//2} correct pairs)")
+    # entropy trained per species (shared across types of same species)
+    n_entropy = n_species if per_mono else 1
+    type_str  = f" × {T} types = {N} particles" if T > 1 else ""
+    print(f"Species      : {n_species}  ({n_species//2} correct pairs){type_str}")
     print(f"Target sched : {target_sched}")
     print(f"Permutations : {len(all_schedules)}  (target idx = {target_idx})")
     print(f"Equilibration: pH 7,  t = {static['equil_duration']} (β=1)")
     print(f"J_max        : {J_max}  kT")
     print(f"Smooth width : {smooth}  ({'enabled' if smooth > 0 else 'disabled'})")
     if S_max > 0:
-        mode = f"per-monomer ({n} values)" if per_mono else "shared (1 value)"
+        mode = f"per-species ({n_species} values)" if per_mono else "shared (1 value)"
         print(f"Entropy      : S_max = {S_max} kT, {mode}")
 
     # ------------------------------------------------------------------
-    # Initial parameters
+    # Initial parameters  (pKa: one per species, shared across types)
     # ------------------------------------------------------------------
     rng    = np.random.default_rng(int(config.get('seed', 42)))
     pH_min, pH_max = float(min(target_sched)), float(max(target_sched))
     pKa_init = []
-    for i in range(n):
-        if acid_base_np[i] == 0:
+    for i in range(n_species):
+        if i % 2 == 0:  # acid species
             centre = np.clip(pH_min + 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
-        else:
+        else:            # base species
             centre = np.clip(pH_max - 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
         pKa_init.append(float(centre))
 
@@ -351,9 +373,9 @@ def train(config):
 
     # Perturb initial free-monomer concentrations (±20 % multiplicative noise),
     # then renormalise so total monomer content M = 1 is preserved.
-    free_init  = np.ones(n) / n * rng.uniform(0.8, 1.2, n)
+    free_init  = np.ones(N) / N * rng.uniform(0.8, 1.2, N)
     free_init /= free_init.sum()
-    n_dimers   = n * (n + 1) // 2
+    n_dimers   = N * (N + 1) // 2
     initial_state = jnp.concatenate([jnp.array(free_init), jnp.zeros(n_dimers)])
 
     # ------------------------------------------------------------------
@@ -447,11 +469,14 @@ def train(config):
     else:
         print("\nTraining complete.")
 
-    p_final = constrain_params(raw_params, J_max=J_max, S_max=S_max)
-    mono_s  = _get_monomer_entropy(p_final)
+    p_final  = constrain_params(raw_params, J_max=J_max, S_max=S_max)
+    mono_s   = _get_monomer_entropy(p_final)
+    pKa_full = jnp.repeat(p_final['pKa'], T) if T > 1 else p_final['pKa']
+    if mono_s is not None and per_mono and T > 1:
+        mono_s = jnp.repeat(mono_s, T)
     equil_state = simulate_schedule_scan(
         initial_state, jnp.array([7.0]), static['equil_duration'],
-        p_final['pKa'], static['acid_base'], p_final['phi'], p_final['J'],
+        pKa_full, static['acid_base'], p_final['phi'], p_final['J'],
         static['beta'], static['k0'],
         static['correct_mask'], static['n'], static['i_idx'], static['j_idx'],
         n_points=static['n_points_equil'],
