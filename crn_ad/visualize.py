@@ -492,38 +492,26 @@ def plot_summary(loss_history, score_history, param_history,
     if mono_arr is not None and len(mono_arr) > 1 and T > 1:
         mono_arr = np.repeat(mono_arr, T)
 
-    specific_bonds    = static.get('specific_bonds', False)
-    species_pair_mask = static.get('species_pair_mask_np', None)
-
     correct_count_dG = 0
     for k in range(n_triu):
         ii, jj = int(i_idx[k]), int(j_idx[k])
-        # Skip pairs with zero interaction (forbidden by --specific_bonds)
-        if specific_bonds and species_pair_mask is not None:
-            if not species_pair_mask[ii, jj]:
-                continue
-        is_correct = bool(correct_mask_np[ii, jj])
-        phi_fac = 1.0 if is_correct else phi
+        # Only show correct bonds in the dG panel
+        if not correct_mask_np[ii, jj]:
+            continue
         qs = np.array([
             float(henderson_hasselbalch(jnp.array(pKa_full), ph, jnp.array(acid_base))[ii]) *
             float(henderson_hasselbalch(jnp.array(pKa_full), ph, jnp.array(acid_base))[jj])
             for ph in pHs
         ])
-        dG_line = J * phi_fac * qs
+        dG_line = J * qs
         if mono_arr is not None:
             si = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[ii])
             sj = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[jj])
             dG_line = dG_line + si + sj
-        if is_correct:
-            col = _correct_dimer_color(correct_count_dG)
-            lw, ls = 2.2, '-'
-            lbl = f'{plabels[ii]}–{plabels[jj]} ✓'
-            correct_count_dG += 1
-        else:
-            col = '#aaaaaa'
-            lw, ls = 0.9, '--'
-            lbl = f'{plabels[ii]}–{plabels[jj]}'
-        ax_dG.plot(pHs, dG_line, color=col, linewidth=lw, linestyle=ls, label=lbl)
+        col = _correct_dimer_color(correct_count_dG)
+        lbl = f'{plabels[ii]}–{plabels[jj]} ✓'
+        ax_dG.plot(pHs, dG_line, color=col, linewidth=2.2, linestyle='-', label=lbl)
+        correct_count_dG += 1
     ax_dG.axhline(0, color='black', linewidth=0.7)
     for pH_v in pH_schedule:
         ax_dG.axvline(pH_v, color='#e74c3c', linewidth=0.9, linestyle=':', alpha=0.7)

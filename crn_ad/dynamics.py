@@ -67,12 +67,27 @@ def crn_ode(state, t,
 def simulate_segment(state, pH, duration,
                      pKa, acid_base, phi, J, beta, k0,
                      correct_mask, n, i_idx, j_idx,
-                     n_points=60, monomer_entropy=None, allowed_mask=None):
+                     n_points=60, monomer_entropy=None, allowed_mask=None,
+                     beta_ramp_duration=0.0):
+    """Simulate one pH segment.
+
+    beta_ramp_duration: if > 0, beta ramps linearly from 0 → beta over the
+    first beta_ramp_duration time units, then stays at beta.  Used for the
+    equilibration segment to avoid a sharp-switch ODE transient.
+    """
     t_span = jnp.linspace(0.0, float(duration), n_points)
-    ode_fn = lambda s, t, _pKa, _phi, _J: crn_ode(
-        s, t, _pKa, acid_base, _phi, _J,
-        beta, k0, pH, correct_mask, n, i_idx, j_idx,
-        monomer_entropy, allowed_mask)
+    if beta_ramp_duration > 0.0:
+        _ramp = float(beta_ramp_duration)
+        def ode_fn(s, t, _pKa, _phi, _J):
+            beta_t = jnp.where(t < _ramp, float(beta) * t / _ramp, float(beta))
+            return crn_ode(s, t, _pKa, acid_base, _phi, _J,
+                           beta_t, k0, pH, correct_mask, n, i_idx, j_idx,
+                           monomer_entropy, allowed_mask)
+    else:
+        def ode_fn(s, t, _pKa, _phi, _J):
+            return crn_ode(s, t, _pKa, acid_base, _phi, _J,
+                           beta, k0, pH, correct_mask, n, i_idx, j_idx,
+                           monomer_entropy, allowed_mask)
     traj = odeint(ode_fn, state, t_span, pKa, phi, J,
                   rtol=1e-4, atol=1e-6, mxstep=1000)
     return traj[-1], traj
@@ -81,7 +96,8 @@ def simulate_segment(state, pH, duration,
 def simulate_schedule(initial_state, pH_schedule, duration_per_seg,
                       pKa, acid_base, phi, J, beta, k0,
                       correct_mask, n, i_idx, j_idx,
-                      n_points=60, monomer_entropy=None, allowed_mask=None):
+                      n_points=60, monomer_entropy=None, allowed_mask=None,
+                      beta_ramp_duration=0.0):
     """Python-loop simulation — use for visualisation only (not inside JIT)."""
     state, traj_list = initial_state, []
     for pH in pH_schedule:
@@ -89,7 +105,7 @@ def simulate_schedule(initial_state, pH_schedule, duration_per_seg,
             state, float(pH), duration_per_seg,
             pKa, acid_base, phi, J, beta, k0,
             correct_mask, n, i_idx, j_idx, n_points,
-            monomer_entropy, allowed_mask)
+            monomer_entropy, allowed_mask, beta_ramp_duration)
         traj_list.append(traj)
     return state, traj_list
 
@@ -102,19 +118,20 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                            smooth_width=0.0,
                            monomer_entropy=None,
                            ph_initial=None,
-                           allowed_mask=None):
+                           allowed_mask=None,
+                           beta_ramp_duration=0.0):
     """
     Scan-based simulation — O(1) JAX graph via lax.scan + vmap.
 
-    smooth_width : if > 0, pH ramps smoothly at each segment start using
-                  a logistic sigmoid over this many time units.
-    ph_initial   : pH before this schedule (used for the first segment's
-                   ramp when smooth_width > 0).  Defaults to pH_schedule[0]
-                   (no ramp on first segment).
-    allowed_mask : if not None, pairs outside this mask have ΔG=0
-                   (used with --specific_bonds).
+    smooth_width       : if > 0, pH ramps smoothly at each segment start.
+    ph_initial         : pH before this schedule (for smooth ramp on first seg).
+    allowed_mask       : if not None, pairs outside this mask have ΔG=0.
+    beta_ramp_duration : if > 0, beta ramps linearly 0→beta over this many
+                         time units at the start of the segment (used for the
+                         equilibration segment to avoid stiff transients).
     """
     t_span = jnp.linspace(0.0, float(duration_per_seg), n_points)
+    _ramp  = float(beta_ramp_duration)
 
     if smooth_width > 0.0:
         w = float(smooth_width)
@@ -124,10 +141,12 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
             state, pH_prev = carry
 
             def ode_fn(s, t, _pKa, _phi, _J, _pH_prev, _pH_target):
-                blend = jax.nn.sigmoid((t - w * 0.5) / (w * 0.2 + 1e-8))
-                pH    = _pH_prev + (_pH_target - _pH_prev) * blend
+                blend  = jax.nn.sigmoid((t - w * 0.5) / (w * 0.2 + 1e-8))
+                pH     = _pH_prev + (_pH_target - _pH_prev) * blend
+                beta_t = (jnp.where(t < _ramp, float(beta) * t / _ramp, float(beta))
+                          if _ramp > 0.0 else beta)
                 return crn_ode(s, t, _pKa, acid_base, _phi, _J,
-                               beta, k0, pH, correct_mask, n, i_idx, j_idx,
+                               beta_t, k0, pH, correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask)
 
             traj = odeint(ode_fn, state, t_span,
@@ -141,8 +160,10 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
     else:
         def segment_fn(state, pH):
             def ode_fn(s, t, _pKa, _phi, _J):
+                beta_t = (jnp.where(t < _ramp, float(beta) * t / _ramp, float(beta))
+                          if _ramp > 0.0 else beta)
                 return crn_ode(s, t, _pKa, acid_base, _phi, _J,
-                               beta, k0, pH, correct_mask, n, i_idx, j_idx,
+                               beta_t, k0, pH, correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask)
             traj = odeint(ode_fn, state, t_span, pKa, phi, J,
                           rtol=1e-4, atol=1e-6, mxstep=1000)

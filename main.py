@@ -104,6 +104,9 @@ def build_parser():
                         'Equivalent to phi=0 between wrong-species pairs. '
                         'Within the correct species pair, phi still controls the '
                         'binding strength of type mismatches (A1-B2 etc.).')
+    p.add_argument('--fixed_phi', type=float, default=None,
+                   help='If set, fix phi at this value in [0, 1] for the entire run '
+                        'and do not train it.  If omitted, phi is a free parameter.')
     return p
 
 
@@ -166,6 +169,7 @@ def _static_dict(n_species, T, beta, k0, n_points_sim, n_points_equil,
         'n_points_sim'        : int(n_points_sim),
         'n_points_equil'      : int(n_points_equil),
         'equil_duration'      : float(equil_duration),
+        'equil_ramp_duration' : float(equil_duration) / 2.0,
         'tau'                 : float(tau),
         'J_max'               : float(J_max),
         'S_max'               : float(S_max),
@@ -189,6 +193,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
     if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
         mono_s = jnp.repeat(mono_s, T)
 
+    equil_ramp = float(static.get('equil_ramp_duration', 0.0))
     equil_final, equil_traj = simulate_schedule(
         make_initial_state(n), [7.0], static['equil_duration'],
         pKa_full, static['acid_base'],
@@ -198,6 +203,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
         n_points=static['n_points_equil'],
         monomer_entropy=mono_s,
         allowed_mask=allowed_mask,
+        beta_ramp_duration=equil_ramp,
     )
 
     final_state, schedule_trajs = simulate_schedule(
@@ -255,6 +261,7 @@ def main():
             S_max                = args.S_max,
             per_monomer_entropy  = args.per_monomer_entropy,
             specific_bonds       = args.specific_bonds,
+            fixed_phi            = args.fixed_phi,
         )
 
         print('=' * 60)
@@ -264,7 +271,8 @@ def main():
         (raw_params, loss_history, score_history, param_history,
          static, all_schedules, target_idx, _) = train(config)
 
-        p_eval = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max)
+        p_eval = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max,
+                                  fixed_phi=args.fixed_phi)
         p_eval = {k: (np.array(v) if hasattr(v, '__len__') else float(v))
                   for k, v in p_eval.items()}
 
@@ -282,6 +290,7 @@ def main():
             'S_max'             : args.S_max,
             'per_monomer_entropy': args.per_monomer_entropy,
             'specific_bonds'     : args.specific_bonds,
+            'fixed_phi'          : args.fixed_phi,
         }
         if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
             params_out['monomer_entropy'] = np.atleast_1d(
@@ -296,7 +305,8 @@ def main():
         for i in range(args.n_species):
             ab = 'base' if int(static['acid_base'][i * T_val]) == 1 else 'acid'
             print(f'  {SPECIES_NAMES[i]} ({ab:<4s}): pKa = {float(p_eval["pKa"][i]):.3f}')
-        print(f'  φ = {float(p_eval["phi"]):.4f}')
+        phi_tag = f' (fixed)' if args.fixed_phi is not None else ''
+        print(f'  φ = {float(p_eval["phi"]):.4f}{phi_tag}')
         print(f'  J = {float(p_eval["J"]):.4f}  kT')
         if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
             s = np.atleast_1d(p_eval['monomer_entropy'])

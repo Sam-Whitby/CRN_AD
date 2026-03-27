@@ -40,18 +40,19 @@ from .dynamics import (simulate_schedule, simulate_schedule_scan,
 # Parameter constraints
 # ---------------------------------------------------------------------------
 
-def constrain_params(raw, J_max=3.5, S_max=0.0):
+def constrain_params(raw, J_max=3.5, S_max=0.0, fixed_phi=None):
     """
     Map unconstrained (ℝ) raw parameters to physical ranges.
 
     pKa            ∈ [3, 10]       via 3 + 7·σ(raw)
-    phi            ∈ [0, 1]        via σ(raw)
+    phi            ∈ [0, 1]        via σ(raw)  (or fixed_phi if not None)
     J              ∈ [0.5, J_max]  via 0.5 + (J_max−0.5)·σ(raw)
     monomer_entropy∈ [0, S_max]    via S_max·σ(raw)   (scalar or n-vector)
     """
     out = {
         'pKa': 3.0 + 7.0 * jax.nn.sigmoid(raw['pKa']),
-        'phi': jax.nn.sigmoid(raw['phi']),
+        'phi': (jnp.array(float(fixed_phi)) if fixed_phi is not None
+                else jax.nn.sigmoid(raw['phi'])),
         'J':   0.5 + (J_max - 0.5) * jax.nn.sigmoid(raw['J']),
     }
     if S_max > 0.0 and 'monomer_entropy' in raw:
@@ -135,17 +136,21 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     """
     p = constrain_params(raw_params,
                          J_max=static['J_max'],
-                         S_max=static.get('S_max', 0.0))
+                         S_max=static.get('S_max', 0.0),
+                         fixed_phi=static.get('fixed_phi'))
     mono_s       = _get_monomer_entropy(p)
     sw           = float(static.get('smooth_width', 0.0))
     T            = static.get('T', 1)
     allowed_mask = static.get('allowed_mask', None)
+    equil_ramp   = float(static.get('equil_ramp_duration', 0.0))
     # Expand species-level pKa (n_species,) → particle-level (N,)
     pKa_full = jnp.repeat(p['pKa'], T) if T > 1 else p['pKa']
     # Expand per-species entropy (n_species,) → (N,) when T > 1
     if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
         mono_s = jnp.repeat(mono_s, T)
 
+    # Score is computed from the FINAL state after the full schedule —
+    # equil gives the starting state, then each permutation is run to completion.
     equil_state = simulate_schedule_scan(
         initial_state, jnp.array([7.0]), static['equil_duration'],
         pKa_full, static['acid_base'], p['phi'], p['J'],
@@ -157,6 +162,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
         monomer_entropy=mono_s,
         ph_initial=7.0,
         allowed_mask=allowed_mask,
+        beta_ramp_duration=equil_ramp,
     )
 
     def score_one(pH_sched):
@@ -208,6 +214,8 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
         mono_s = jnp.repeat(mono_s, T)
 
+    equil_ramp = float(static.get('equil_ramp_duration', 0.0))
+
     # JIT-compiled scoring function (traced once, cached by JAX)
     @jax.jit
     def _score_all(pKa, phi, J, all_pH_array):
@@ -222,6 +230,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
             monomer_entropy=mono_s,
             ph_initial=7.0,
             allowed_mask=allowed_mask,
+            beta_ramp_duration=equil_ramp,
         )
 
         def score_one(pH_sched):
@@ -281,6 +290,9 @@ def train(config):
     smooth         = float(config.get('smooth_width', 0.0))
     per_mono       = bool(config.get('per_monomer_entropy', False))
     specific_bonds = bool(config.get('specific_bonds', False))
+    fixed_phi_val  = config.get('fixed_phi', None)
+    if fixed_phi_val is not None:
+        fixed_phi_val = float(np.clip(fixed_phi_val, 0.0, 1.0))
 
     # ------------------------------------------------------------------
     # Static quantities
@@ -340,6 +352,8 @@ def train(config):
         'per_monomer_entropy': per_mono,
         'specific_bonds'     : specific_bonds,
         'allowed_mask'       : allowed_mask_jax,
+        'fixed_phi'          : fixed_phi_val,
+        'equil_ramp_duration': float(config.get('equil_duration', 80.0)) / 2.0,
     }
 
     # ------------------------------------------------------------------
@@ -477,12 +491,14 @@ def train(config):
             if S_max > 0.0 and 'monomer_entropy' in p_cur:
                 s = p_cur['monomer_entropy']
                 s_str = f' | s̄={float(jnp.mean(s)):.3f} sₘₐₓ={float(jnp.max(s)):.3f}'
+            phi_str = (f'{fixed_phi_val:.3f} (fixed)' if fixed_phi_val is not None
+                       else f'{float(p_cur["phi"]):.3f}')
             print(
                 f"Epoch {epoch:4d}/{n_epochs} | "
                 f"loss={float(lv):.4f} | "
                 f"target={float(sc[target_idx]):.3f} | "
                 f"mean_other={float(jnp.mean(jnp.delete(sc, target_idx))):.3f} | "
-                f"pKa=[{pKa_str}] | φ={float(p_cur['phi']):.3f} | "
+                f"pKa=[{pKa_str}] | φ={phi_str} | "
                 f"J={float(p_cur['J']):.3f}{s_str}",
                 flush=True,
             )
@@ -505,6 +521,7 @@ def train(config):
         n_points=static['n_points_equil'],
         smooth_width=smooth, monomer_entropy=mono_s, ph_initial=7.0,
         allowed_mask=allowed_mask_jax,
+        beta_ramp_duration=static['equil_ramp_duration'],
     )
 
     return (raw_params, loss_history, score_history, param_history,
