@@ -252,6 +252,7 @@ def train(config):
     S_max              : float   (default 0.0 = no entropy params)
     per_monomer_entropy: bool    (default False = single shared s)
     seed               : int
+    (NaN: training stops at the last finite epoch; report is always generated)
     """
     n = config['n_species']
     assert n % 2 == 0 and 2 <= n <= 10
@@ -399,7 +400,6 @@ def train(config):
     # Training loop
     # ------------------------------------------------------------------
     n_epochs      = int(config.get('n_epochs', 300))
-    max_retries   = int(config.get('max_nan_retries', 6))
 
     loss_history  = [float(lv)]
     score_history = [np.array(sc)]
@@ -407,39 +407,19 @@ def train(config):
     p0 = constrain_params(raw_params, J_max=J_max, S_max=S_max)
     param_history = [_snapshot(p0, S_max)]
 
-    best_params = raw_params if _params_finite(raw_params) else None
-
+    nan_stopped = False
     for epoch in range(1, n_epochs):
-        prev_params   = raw_params
-        prev_opt      = opt_state
-
         new_params, new_opt, lv, sc = step(raw_params, opt_state, lr_jax)
 
-        # --- NaN retry: restore pre-step state, halve lr, try again ---
-        for retry in range(max_retries):
-            if np.isfinite(float(lv)) and _params_finite(new_params):
-                break
-            lr     = lr * 0.5
-            lr_jax = jnp.array(lr)
-            print(f"  NaN at epoch {epoch} "
-                  f"(retry {retry + 1}/{max_retries}) — lr → {lr:.2e}", flush=True)
-            new_params, new_opt, lv, sc = step(prev_params, prev_opt, lr_jax)
+        if not (np.isfinite(float(lv)) and _params_finite(new_params)):
+            print(f"\nNaN encountered at epoch {epoch} — "
+                  f"stopping early and reporting results from epoch {epoch - 1}.",
+                  flush=True)
+            nan_stopped = True
+            break
 
-        if np.isfinite(float(lv)) and _params_finite(new_params):
-            raw_params = new_params
-            opt_state  = new_opt
-            if best_params is None or float(lv) < min(loss_history):
-                best_params = raw_params
-        else:
-            # All retries failed — gradient at this point is intrinsically NaN
-            # Fall back to last known-good params, reset Adam
-            if best_params is not None:
-                raw_params = best_params
-            else:
-                raw_params = prev_params
-            opt_state = _opt_core.init(raw_params)
-            lv = loss_history[-1]
-            sc = score_history[-1]
+        raw_params = new_params
+        opt_state  = new_opt
 
         loss_history.append(float(lv))
         score_history.append(np.array(sc))
@@ -462,7 +442,10 @@ def train(config):
                 flush=True,
             )
 
-    print("\nTraining complete.")
+    if nan_stopped:
+        print("Training terminated early (NaN).")
+    else:
+        print("\nTraining complete.")
 
     p_final = constrain_params(raw_params, J_max=J_max, S_max=S_max)
     mono_s  = _get_monomer_entropy(p_final)
