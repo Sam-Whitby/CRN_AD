@@ -11,96 +11,107 @@ the ODE solver.
 
 ### Species and reactions
 
-The system contains `n` monomer species (A, B, C, …), all in a hypothetical
-well-mixed solution at some fixed volume.  Every ordered pair can dimerize:
+The system contains `N` monomer particles in a well-mixed solution.  Every
+pair can dimerize:
 
 ```
-X_i + X_j  ⇌  X_i·X_j    for all 0 ≤ i ≤ j ≤ n−1
+X_i + X_j  ⇌  X_i·X_j    for all 0 ≤ i ≤ j ≤ N−1
 ```
 
-The **correct** (target) pairs are adjacent in the alphabet: (A,B), (C,D),
-(E,F), …  This mimics a protein in which neighbouring residues along the
-backbone form salt bridges when the chain folds.
+Particles are grouped into `n_species` species (A, B, C, …) each with `T`
+type copies (A1, A2, … with `--n_types T`, default T=1), giving N = n_species × T.
+
+The **correct** (target) pairs are same-species, same-type: (A1–B1), (A2–B2),
+(C1–D1), …  This mimics a polymer where neighbouring residues form salt
+bridges when the chain folds.
+
+With `--specific_bonds`, only correct-species pairs interact at all (any Ai
+with any Bj); φ then controls wrong-type within the correct species (A1–B2
+etc.).
 
 ### Henderson-Hasselbalch charges
 
 Each species carries a pH-dependent fractional charge:
 
 ```
-Base-like residue (e.g. Lys, Arg):
-    q_i = +1 / (1 + 10^{pH − pKa_i})
-    → +1 at low pH (protonated), → 0 at high pH
-
-Acid-like residue (e.g. Asp, Glu):
-    q_i = −1 / (1 + 10^{pKa_i − pH})
-    → 0 at low pH (neutral), → −1 at high pH (deprotonated)
+Base-like (e.g. Lys, Arg):  q_i = +1 / (1 + 10^{pH − pKa_i})   → +1 at low pH
+Acid-like (e.g. Asp, Glu):  q_i = −1 / (1 + 10^{pKa_i − pH})   → −1 at high pH
 ```
 
-Species at even index (A, C, E, …) are assigned as *base-like*;
-species at odd index (B, D, F, …) are *acid-like*.  Adjacent correct pairs
-therefore carry opposite charges and attract electrostatically.
+Even-indexed species (A, C, E, …) are base-like; odd-indexed (B, D, F, …) are
+acid-like.  Correct pairs therefore carry opposite charges and attract.
 
-### Electrostatic interaction energy
-
-When two monomers i and j bind, the interaction free energy (in units of
-k_B T) is:
+### Interaction free energy
 
 ```
-ΔG_{ij} = J · q_i · q_j
+ΔG_{ij} = J · q_i · q_j                   (correct pairs)
+ΔG_{ij} = φ · J · q_i · q_j              (incorrect pairs, or wrong-type same-species)
+ΔG_{ij} = 0                               (forbidden pairs, with --specific_bonds)
 ```
 
-where `J` is the dimensionless electrostatic coupling constant.
-
-For **correct** pairs the full interaction is used.  For **incorrect** pairs
-a steric mismatch factor `φ ∈ [0,1]` reduces it:
-
-```
-ΔG_{ij}^{correct}   = J · q_i · q_j
-ΔG_{ij}^{incorrect} = φ · J · q_i · q_j
-```
+`J` is the dimensionless electrostatic coupling (kT units); `φ ∈ [0,1]` is
+the steric mismatch factor.  Opposite charges give ΔG < 0 (attractive);
+like charges give ΔG > 0 (repulsive).
 
 ### Monomer conformational entropy (optional)
 
 When `--S_max > 0`, each monomer i carries a conformational-entropy cost
-`s_i ∈ [0, S_max]` (in kT) for losing internal degrees of freedom upon
-dimerisation.  This adds a symmetric penalty to every pair:
+`s_i ∈ [0, S_max]` for losing internal degrees of freedom upon dimerisation:
 
 ```
 ΔG_{ij} += s_i + s_j
 ```
 
-Because the term is symmetric in i and j, detailed balance is preserved.
-By default a single shared value `s` is trained for all monomers; use
-`--per_monomer_entropy` to train a separate value per species.
+### Metropolis kinetics
 
-### Detailed balance / rate constants
+The rate constants follow **Metropolis-style** kinetics.  The system moves
+at full speed whenever a reaction is downhill in free energy, and only pays
+a kinetic cost when it must climb an energy barrier:
 
 ```
-k_f^{ij} = k_0 · exp(−β · ΔG_{ij})
-k_b^{ij} = k_0
-⟹ k_f / k_b = exp(−β ΔG_{ij})
+k_f^{ij} = k0 · exp(−β · max(ΔG_{ij}, 0))
+k_b^{ij} = k0 · exp(+β · min(ΔG_{ij}, 0))
 ```
+
+This gives:
+
+| Regime            | k_f       | k_b                 | Physical meaning                          |
+|-------------------|-----------|---------------------|-------------------------------------------|
+| ΔG ≤ 0 (downhill) | k0        | k0 · exp(β · ΔG) < k0 | Formation is fast; breaking is slowed by the Boltzmann factor |
+| ΔG > 0 (uphill)   | k0 · exp(−β · ΔG) < k0 | k0 | Formation is penalised; breaking is fast |
+
+Detailed balance is preserved in both cases:
+
+```
+k_f / k_b = exp(−β · ΔG)   ✓   for all ΔG
+```
+
+This is the continuous-time analogue of Metropolis–Hastings: the system
+never slows the fast direction of a spontaneous process — only the direction
+that requires doing work against the free-energy gradient is penalised.  We
+are free to make this choice because detailed balance constrains only the
+*ratio* k_f/k_b; the overall speed scale (k0) is a free parameter.
 
 ### ODE system
 
-The state vector contains free monomer concentrations `[X_i]` and dimer
-concentrations `[X_i·X_j]` (upper triangle, since `[X_i·X_j] = [X_j·X_i]`).
+The state vector contains free-monomer concentrations `[X_i]` and dimer
+concentrations `[X_i·X_j]` (upper triangle only, since [X_i·X_j] = [X_j·X_i]).
 
-The net flux through reaction (i,j) is:
+Net flux through reaction (i,j):
 
 ```
-F_{ij} = k_f^{ij} · [X_i][X_j] − k_0 · [X_i·X_j]
+F_{ij} = k_f^{ij} · [X_i][X_j] − k_b^{ij} · [X_i·X_j]
 ```
 
 Rate equations:
 
 ```
-d[X_i·X_j]/dt = F_{ij}           (i < j, heterodimer)
-d[X_i·X_i]/dt = F_{ii}           (homodimer)
-d[X_i]/dt = −Σ_j F_{ij} − F_{ii} (extra −F_{ii} for homodimer, 2 monomers consumed)
+d[X_i·X_j]/dt = F_{ij}               (i < j, heterodimer)
+d[X_i·X_i]/dt = F_{ii}               (homodimer)
+d[X_i]/dt = −Σ_j F_{ij} − F_{ii}    (extra −F_{ii}: 2 monomers consumed per homodimer)
 ```
 
-Conservation: `Σ_i [X_i] + 2·Σ_{i≤j} [X_i·X_j] = const` (total monomer content).
+Conservation: `Σ_i [X_i] + 2·Σ_{i≤j} [X_i·X_j] = const` (total monomer content M).
 
 ---
 
@@ -109,40 +120,40 @@ Conservation: `Σ_i [X_i] + 2·Σ_{i≤j} [X_i·X_j] = const` (total monomer con
 ### Initial state
 
 Before each pH schedule, the system is equilibrated at **pH 7** for
-`--equil_duration` time units.  This gives a reproducible starting point
-independent of the subsequent schedule.
+`--equil_duration` time units.  To avoid a stiff ODE transient at the start
+of equilibration, β ramps linearly from 0 to its full value over the first
+half of the equilibration period.
 
 ### pH schedules
 
 A target schedule specifies a sequence of pH values, one per time segment
-(e.g. `[9, 5, 7]`).  All unique permutations of this sequence are generated
-automatically; for 3 distinct values that is 6 permutations.
+(e.g. `[9, 5, 7]`).  All unique permutations are generated automatically;
+for 3 distinct values that is 6 permutations.
 
 ### pH smoothing (`--smooth_width`)
 
 By default pH changes are instantaneous (step function).  With
 `--smooth_width W`, each transition is replaced with a logistic sigmoid ramp
-over `W` time units at the start of each segment.  This eliminates RHS
-discontinuities that can cause NaN gradients in the adjoint ODE, and is
-recommended whenever `--J_max > 3.5` or `--lr > 0.05`.  The pH(t) profile
-is shown on the concentration panel of the summary plot.
+over `W` time units.  This eliminates RHS discontinuities that can cause NaN
+gradients in the adjoint ODE, and is recommended whenever `--J_max > 3.5` or
+`--lr > 0.05`.
 
 ### Score
 
-After integrating the CRN through a schedule, the *score* is the fraction
-of total monomer content residing in correct dimers:
+After integrating the CRN through a schedule, the *score* is the fraction of
+total monomer content residing in correct dimers (computed from the **final
+state only**, after the full schedule):
 
 ```
-score(s) = 2 · Σ_{correct pairs} [X_i·X_j] / (Σ_i [X_i] + 2·Σ_{i≤j} [X_i·X_j])
+score = 2 · Σ_{correct pairs} [X_i·X_j] / (Σ_i [X_i] + 2·Σ_{i≤j} [X_i·X_j])
 ```
 
 ### Loss function
 
-The loss is a **softmax cross-entropy** over all permutations:
+Softmax cross-entropy over all permutations:
 
 ```
-L = −log [ exp(τ · score_target) / Σ_s exp(τ · score_s) ]
-  = −log_softmax(τ · scores)[target_idx]
+L = −log_softmax(τ · scores)[target_idx]
 ```
 
 Minimising L simultaneously maximises the score under the target schedule
@@ -152,22 +163,19 @@ and suppresses it under all other permutations.
 
 | Parameter | Physical meaning                     | Constraint         |
 |-----------|--------------------------------------|--------------------|
-| `pKa[i]`  | pKa of species i                     | [3, 10]            |
-| `φ`       | Steric mismatch factor               | [0, 1]             |
+| `pKa[i]`  | pKa of species i (shared across types) | [3, 10]          |
+| `φ`       | Steric mismatch factor               | [0, 1] or fixed    |
 | `J`       | Electrostatic coupling               | [0.5, `J_max`]     |
 | `s_i`     | Monomer conformational entropy (opt) | [0, `S_max`] kT    |
 
-All constraints are enforced via sigmoid reparameterisations, keeping
-gradient optimisation unconstrained throughout.
+All constraints are enforced via sigmoid reparameterisations.
+`--fixed_phi VALUE` removes φ from training and holds it at the given value.
 
 ### NaN handling
 
-Training uses a Python-level retry loop: before each gradient step the
-current parameters and optimiser state are saved.  If the step produces a
-NaN loss or NaN parameters, the step is retried from the pre-step state
-with the learning rate halved (up to 3 retries).  If all retries fail, the
-optimiser is reset to the best parameters seen so far.  The learning-rate
-reduction is persistent across subsequent epochs.
+If a NaN loss or NaN parameters are encountered during training, training
+stops immediately and the report is generated from the last fully-finite
+epoch.
 
 ---
 
@@ -209,20 +217,28 @@ python main.py --mode animate --outdir outputs
 
 ### Stability — large J or high learning rate
 ```bash
-# Raise J cap with smooth pH transitions for ODE stability
 python main.py --J_max 5.0 --smooth_width 2.0
+```
 
-# Smooth transitions only (keep default J_max)
-python main.py --smooth_width 1.5
+### Types per species
+```bash
+# 4 species × 3 types = 12 particles; correct bonds are A1-B1, A2-B2, A3-B3, C1-D1, ...
+python main.py --n_species 4 --n_types 3
+
+# Only allow correct-species pairs to interact at all
+python main.py --n_species 4 --n_types 3 --specific_bonds
+```
+
+### Fixed phi
+```bash
+# Hold phi at 0.2 for the entire run (not trained)
+python main.py --fixed_phi 0.2
 ```
 
 ### Monomer conformational entropy
 ```bash
-# Single shared entropy value for all monomers (default off)
-python main.py --S_max 2.0
-
-# Separate entropy value per monomer species
-python main.py --S_max 2.0 --per_monomer_entropy
+python main.py --S_max 2.0                    # single shared value
+python main.py --S_max 2.0 --per_monomer_entropy  # per-species value
 ```
 
 ### Generate animated GIFs as well
@@ -234,6 +250,7 @@ python main.py --animate
 ```
 Core
   --n_species          Number of species (even, max 10)              [4]
+  --n_types            Types per species T; N = n_species × T        [1]
   --target_pH          pH values for target schedule                 [9.0 5.0 7.0]
   --duration           Duration per segment (time units)             [30.0]
   --equil_duration     Duration of pH-7 pre-equilibration            [80.0]
@@ -250,16 +267,16 @@ Simulation accuracy
 
 ODE stability
   --J_max              Hard cap on coupling constant J (kT)          [3.5]
-                       Larger values allow stronger binding but
-                       increase ODE stiffness; use with --smooth_width.
-  --smooth_width       Sigmoid ramp width at each pH transition (time units) [0.0]
+  --smooth_width       Sigmoid ramp width at each pH transition      [0.0]
                        0 = step function; 1–3 recommended for J_max > 3.5.
+
+Physics flags
+  --specific_bonds     Only correct-species pairs interact           [off]
+  --fixed_phi VALUE    Fix φ at this value; do not train it          [off]
 
 Conformational entropy
   --S_max              Enable monomer entropy; s_i ∈ [0, S_max] kT   [0.0]
-                       ΔG_ij += s_i + s_j for every dimer pair.
-  --per_monomer_entropy Train a separate s_i per species (n values)  [off]
-                       Default: one shared value for all monomers.
+  --per_monomer_entropy Train a separate s_i per species              [off]
 
 Output
   --outdir             Output directory                              [outputs]
@@ -288,7 +305,7 @@ All outputs are written to `--outdir` (default `outputs/`):
 ```
 CRN_AD/
 ├── crn_ad/
-│   ├── physics.py    Henderson-Hasselbalch, interaction energies, rate constants
+│   ├── physics.py    Henderson-Hasselbalch charges, interaction energies, rate matrices
 │   ├── dynamics.py   ODE system, simulation (segment + lax.scan schedule)
 │   ├── training.py   Loss function, parameter constraints, training loop
 │   └── visualize.py  Summary plot (training curve, scores, concentrations, pH trace)
@@ -306,20 +323,25 @@ CRN_AD/
    odeint call via the adjoint method, allowing gradient-based optimisation
    of all physical parameters end-to-end.
 
-2. **Thermodynamic consistency.**  All reaction rates satisfy detailed balance,
+2. **Thermodynamic consistency.**  All rate constants satisfy detailed balance,
    so the ODE has a well-defined free energy landscape and the equilibrium
-   state is the true Boltzmann distribution for the current Hamiltonian.
+   state is the Boltzmann distribution for the current Hamiltonian.
 
-3. **Physically motivated parameterisation.**  pKa values, coupling strength,
+3. **Metropolis kinetics.**  The kinetic rule mirrors Metropolis–Hastings:
+   downhill reactions proceed at full speed k0; only uphill steps are
+   penalised.  This is physically natural — it ensures that spontaneous
+   processes are not artificially slowed, and that kinetic barriers appear
+   only where work must be done against the free-energy gradient.
+
+4. **Physically motivated parameterisation.**  pKa values, coupling strength,
    steric penalty, and conformational entropy are all grounded in real polymer
    chemistry.
 
-4. **Principled loss function.**  Softmax cross-entropy naturally handles an
+5. **Principled loss function.**  Softmax cross-entropy naturally handles an
    arbitrary number of competing schedules without manual weight tuning.
 
-5. **Fast evaluation.**  Post-training scoring of all permutations uses
-   `jax.jit + jax.vmap`, compiled once and evaluated in parallel — no
-   per-permutation recompilation.
+6. **Fast evaluation.**  Post-training scoring of all permutations uses
+   `jax.jit + jax.vmap`, compiled once and evaluated in parallel.
 
 ### Weaknesses and limitations
 

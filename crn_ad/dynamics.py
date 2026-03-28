@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.ode import odeint
 
-from .physics import henderson_hasselbalch, interaction_energy_matrix, forward_rate_matrix
+from .physics import henderson_hasselbalch, interaction_energy_matrix, rate_matrices
 
 
 def make_triu_indices(n):
@@ -55,9 +55,9 @@ def crn_ode(state, t,
     dG         = interaction_energy_matrix(charges, correct_mask, phi, J,
                                            monomer_entropy=monomer_entropy,
                                            allowed_mask=allowed_mask)
-    kf         = forward_rate_matrix(dG, beta, k0)
+    kf, kb     = rate_matrices(dG, beta, k0)
     dimer_full = triu_to_full(dimer_triu, n, i_idx, j_idx)
-    flux       = kf * jnp.outer(free, free) - k0 * dimer_full
+    flux       = kf * jnp.outer(free, free) - kb * dimer_full
 
     d_free       = -(jnp.sum(flux, axis=1) + jnp.diag(flux))
     d_dimer_triu = flux[i_idx, j_idx]

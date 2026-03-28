@@ -64,8 +64,26 @@ def interaction_energy_matrix(charges, correct_mask, phi, J,
     return dG
 
 
-def forward_rate_matrix(dG, beta, k0):
+def rate_matrices(dG, beta, k0):
     """
-    k_f^{ij} = k_0 · exp(−β · ΔG_{ij}),   k_b^{ij} = k_0
+    Metropolis kinetics — guaranteed detailed balance for all ΔG.
+
+    k_f^{ij} = k0 · exp(−β · max(ΔG_{ij}, 0))
+    k_b^{ij} = k0 · exp(+β · min(ΔG_{ij}, 0))
+
+    When ΔG ≤ 0 (favourable formation):
+        k_f = k0            — formation is unimpeded
+        k_b = k0·exp(βΔG) < k0  — breaking is slowed by the Boltzmann factor
+    When ΔG > 0 (unfavourable formation):
+        k_f = k0·exp(−βΔG) < k0 — formation is penalised
+        k_b = k0            — breaking is unimpeded
+
+    Ratio:  k_f / k_b = exp(−β·ΔG)  in both cases  ✓  (detailed balance).
+
+    This is the continuous-time analogue of Metropolis–Hastings: the
+    system moves at full speed whenever a reaction is downhill, and only
+    pays a kinetic cost when climbing an energy barrier.
     """
-    return k0 * jnp.exp(-beta * dG)
+    kf = k0 * jnp.exp(-beta * jnp.maximum(dG, 0.0))
+    kb = k0 * jnp.exp( beta * jnp.minimum(dG, 0.0))
+    return kf, kb
