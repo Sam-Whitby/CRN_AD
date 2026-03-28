@@ -127,8 +127,11 @@ def build_parser():
                         'One value → same J for all correct pairs. '
                         'n_species/2 values → one J per correct species pair '
                         '(e.g. --eval_J 3.0 1.5 for two pairs A-B and C-D).')
-    p.add_argument('--eval_monomer_entropy', type=float, default=None,
-                   help='(--mode eval) Shared monomer entropy s (kT). Optional.')
+    p.add_argument('--eval_monomer_entropy', nargs='+', type=float, default=None,
+                   help='(--mode eval) Monomer conformational entropy s (kT). '
+                        'One value → shared across all species. '
+                        'n_species values (with --per_monomer_entropy) → one per species. '
+                        'If omitted and --S_max > 0, defaults to S_max for all species.')
     return p
 
 
@@ -473,21 +476,44 @@ def main():
                   f'{n_pairs} values (one per correct pair). Got {len(j_raw)}.')
             sys.exit(1)
 
+        # --- Monomer entropy for eval mode ---
+        # If --eval_monomer_entropy is given, use those values.
+        # If omitted but --S_max > 0, default to S_max as the shared value.
+        # Validate count: must be 1 (shared) or n_species (per-species).
+        me_raw = args.eval_monomer_entropy
+        if me_raw is not None:
+            if len(me_raw) == 1:
+                mono_eval = np.array(me_raw, dtype=float)        # shape (1,) → shared
+            elif len(me_raw) == args.n_species:
+                mono_eval = np.array(me_raw, dtype=float)        # shape (n_species,)
+            else:
+                print(f'ERROR: --eval_monomer_entropy must have 1 value (shared) or '
+                      f'{args.n_species} values (one per species). Got {len(me_raw)}.')
+                sys.exit(1)
+            # S_max must cover the given entropy so _get_mono doesn't silently drop it.
+            # If user forgot --S_max, infer it from the given values.
+            S_max_eval = max(args.S_max, float(np.max(mono_eval)))
+        elif args.S_max > 0.0:
+            # --S_max given, no explicit entropy → use S_max as the shared entropy value
+            mono_eval  = np.array([args.S_max], dtype=float)
+            S_max_eval = args.S_max
+        else:
+            mono_eval  = None
+            S_max_eval = 0.0
+
         static = _static_dict(
             args.n_species, args.n_types,
             args.beta, args.k0,
             args.n_points_sim, args.n_points_equil,
             args.equil_duration, args.tau,
-            args.J_max, args.S_max, args.smooth_width,
+            args.J_max, S_max_eval, args.smooth_width,
             args.per_monomer_entropy, args.specific_bonds,
         )
-        mono_eval = (np.array([args.eval_monomer_entropy])
-                     if args.eval_monomer_entropy is not None else None)
         p_eval = {
             'pKa'            : np.array(args.eval_pKa),
             'phi'            : float(args.eval_phi),
             'J'              : J_eval,
-            'monomer_entropy': mono_eval,
+            'monomer_entropy': mono_eval,   # None or array
         }
         target_sched  = [float(x) for x in args.target_pH]
         all_schedules = all_unique_permutations(target_sched)
