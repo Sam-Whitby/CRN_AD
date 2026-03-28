@@ -10,7 +10,15 @@ state[n:]   dimer concentrations in upper-triangle order
 Reactions
 ---------
   X_i + X_j  ⇌  X_i X_j   for all 0 ≤ i ≤ j ≤ n−1
-  k_f^{ij} = k0 · exp(−β ΔG_{ij}),   k_b = k0   (detailed balance)
+  Metropolis kinetics (detailed balance):
+    k_f^{ij} = k0 · exp(−β · max(ΔG_{ij}, 0))
+    k_b^{ij} = k0 · exp(+β · min(ΔG_{ij}, 0))
+
+Non-negativity
+--------------
+  The RHS clips state to ≥ 0 before computing fluxes, and every odeint
+  output is projected via jnp.maximum(state, 0) before being carried
+  forward.  Both operations are differentiable through JAX autodiff.
 
 Conservation
 ------------
@@ -90,7 +98,10 @@ def simulate_segment(state, pH, duration,
                            monomer_entropy, allowed_mask)
     traj = odeint(ode_fn, state, t_span, pKa, phi, J,
                   rtol=1e-4, atol=1e-6, mxstep=1000)
-    return traj[-1], traj
+    # Clip to non-negative: odeint can drift slightly below zero due to
+    # numerical error even though the RHS already clips when computing flux.
+    final = jnp.maximum(traj[-1], 0.0)
+    return final, traj
 
 
 def simulate_schedule(initial_state, pH_schedule, duration_per_seg,
@@ -152,7 +163,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
             traj = odeint(ode_fn, state, t_span,
                           pKa, phi, J, pH_prev, pH_target,
                           rtol=1e-4, atol=1e-6, mxstep=1000)
-            return (traj[-1], pH_target), None
+            return (jnp.maximum(traj[-1], 0.0), pH_target), None
 
         (final_state, _), _ = jax.lax.scan(segment_fn,
                                             (initial_state, ph0),
@@ -167,7 +178,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                                monomer_entropy, allowed_mask)
             traj = odeint(ode_fn, state, t_span, pKa, phi, J,
                           rtol=1e-4, atol=1e-6, mxstep=1000)
-            return traj[-1], None
+            return jnp.maximum(traj[-1], 0.0), None
 
         final_state, _ = jax.lax.scan(segment_fn, initial_state, pH_schedule_array)
 
