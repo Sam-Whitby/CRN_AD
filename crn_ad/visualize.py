@@ -328,7 +328,9 @@ def plot_summary(loss_history, score_history, param_history,
     pKa             = np.array(trained_params['pKa'])          # shape (n_species,)
     pKa_full        = np.repeat(pKa, T) if T > 1 else pKa      # shape (N,)
     phi             = float(trained_params['phi'])
-    J               = float(trained_params['J'])
+    J_raw           = trained_params['J']
+    J_arr           = np.array(J_raw)
+    J               = float(J_arr) if J_arr.ndim == 0 else None  # None → per-pair matrix
     S_max           = float(static.get('S_max', 0.0))
     sw              = float(static.get('smooth_width', 0.0))
     J_max           = float(static.get('J_max', 3.5))
@@ -340,7 +342,8 @@ def plot_summary(loss_history, score_history, param_history,
     score_arr  = np.array(score_history)
     pKa_hist   = np.array([p['pKa'] for p in param_history])
     phi_hist   = np.array([p['phi'] for p in param_history])
-    J_hist     = np.array([p['J']   for p in param_history])
+    J_hist     = np.array([float(np.mean(np.array(p['J']))) if np.ndim(np.array(p['J'])) > 0
+                           else float(p['J']) for p in param_history])
 
     n_rows       = 4 if has_entropy else 3
     h_ratios     = ([1.0, 2.5, 1.2, 1.2] if has_entropy
@@ -401,7 +404,8 @@ def plot_summary(loss_history, score_history, param_history,
     ax_phiJ.set_ylabel('φ', color='#2980b9', fontsize=11)
     ax_phiJ.tick_params(axis='y', labelcolor='#2980b9')
     ax2 = ax_phiJ.twinx()
-    ax2.plot(epochs, J_hist, color='#c0392b', linewidth=2, label='J (kT)')
+    j_lbl = 'mean J (kT)' if J is None else 'J (kT)'
+    ax2.plot(epochs, J_hist, color='#c0392b', linewidth=2, label=j_lbl)
     ax2.set_ylabel(f'J  (kT, cap {J_max:.1f})', color='#c0392b', fontsize=11)
     ax2.tick_params(axis='y', labelcolor='#c0392b')
     ax_phiJ.set_title('φ and J evolution', fontsize=12)
@@ -503,7 +507,8 @@ def plot_summary(loss_history, score_history, param_history,
             float(henderson_hasselbalch(jnp.array(pKa_full), ph, jnp.array(acid_base))[jj])
             for ph in pHs
         ])
-        dG_line = J * qs
+        J_ij    = float(J_arr[ii, jj]) if J is None else J
+        dG_line = J_ij * qs
         if mono_arr is not None:
             si = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[ii])
             sj = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[jj])

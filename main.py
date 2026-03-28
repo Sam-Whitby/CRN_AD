@@ -122,8 +122,11 @@ def build_parser():
                    help='(--mode eval) pKa values, one per species.')
     p.add_argument('--eval_phi', type=float, default=None,
                    help='(--mode eval) Steric mismatch factor φ ∈ [0, 1].')
-    p.add_argument('--eval_J', type=float, default=None,
-                   help='(--mode eval) Electrostatic coupling J (kT).')
+    p.add_argument('--eval_J', nargs='+', type=float, default=None,
+                   help='(--mode eval) Electrostatic coupling J (kT). '
+                        'One value → same J for all correct pairs. '
+                        'n_species/2 values → one J per correct species pair '
+                        '(e.g. --eval_J 3.0 1.5 for two pairs A-B and C-D).')
     p.add_argument('--eval_monomer_entropy', type=float, default=None,
                    help='(--mode eval) Shared monomer entropy s (kT). Optional.')
     return p
@@ -247,6 +250,89 @@ def _get_mono(p, static):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _build_J_matrix(J_pairs, n_species, T):
+    """Build an N×N J matrix for eval mode with per-correct-pair coupling.
+
+    Correct pair p uses J_pairs[p].  All other interactions (wrong species,
+    homodimers) use the mean of J_pairs as a baseline before phi is applied.
+    """
+    N = n_species * T
+    n_pairs = n_species // 2
+    J_mean = float(np.mean(J_pairs))
+    J_mat = np.full((N, N), J_mean, dtype=float)
+    for pair_idx in range(n_pairs):
+        J_p = float(J_pairs[pair_idx])
+        for t1 in range(T):
+            for t2 in range(T):
+                i = 2 * pair_idx * T + t1
+                j = (2 * pair_idx + 1) * T + t2
+                J_mat[i, j] = J_p
+                J_mat[j, i] = J_p
+    return jnp.array(J_mat)
+
+
+def _j_scalar_for_history(J):
+    """Return a scalar J suitable for param_history (mean if matrix)."""
+    J_arr = np.array(J)
+    return float(J_arr.mean()) if J_arr.ndim > 0 else float(J_arr)
+
+
+def _print_param_table(p_eval, static, fixed_phi=None, title='Parameters'):
+    """Print a formatted parameter table to stdout."""
+    n_species    = static.get('n_species', static['n'])
+    T            = static.get('T', 1)
+    acid_base_np = np.array(static['acid_base_np'])
+    pKa          = np.array(p_eval['pKa'])
+    phi          = float(p_eval['phi'])
+    J            = p_eval['J']
+    S_max        = float(static.get('S_max', 0.0))
+    W = 60
+
+    print('─' * W)
+    print(f'  {title}')
+    print('─' * W)
+    print(f'  {"Species":<12}  {"Role":<6}  {"pKa":>7}')
+    print(f'  {"─"*12}  {"─"*6}  {"─"*7}')
+    for i in range(n_species):
+        ab = 'base' if int(acid_base_np[i * T]) == 1 else 'acid'
+        print(f'  {SPECIES_NAMES[i]:<12}  {ab:<6}  {float(pKa[i]):>7.4f}')
+
+    phi_tag = '  (fixed)' if fixed_phi is not None else ''
+    print()
+    print(f'  {"φ (steric factor)":<28} {phi:.4f}{phi_tag}')
+
+    J_arr = np.array(J)
+    if J_arr.ndim == 0:
+        print(f'  {"J (coupling)":<28} {float(J_arr):.4f}  kT')
+    else:
+        print(f'  J (coupling, per pair):')
+        for pair_idx in range(n_species // 2):
+            A   = SPECIES_NAMES[2 * pair_idx]
+            B   = SPECIES_NAMES[2 * pair_idx + 1]
+            i0  = 2 * pair_idx * T
+            j0  = (2 * pair_idx + 1) * T
+            j_v = float(J_arr[i0, j0])
+            print(f'    {A}–{B}: {j_v:.4f}  kT')
+
+    if S_max > 0.0 and p_eval.get('monomer_entropy') is not None:
+        s = np.atleast_1d(np.array(p_eval['monomer_entropy']))
+        if len(s) == 1:
+            print(f'  {"s (entropy, shared)":<28} {float(s[0]):.4f}  kT')
+        else:
+            for i, sv in enumerate(s):
+                print(f'  {"s(" + SPECIES_NAMES[i] + ")":<28} {float(sv):.4f}  kT')
+
+    print()
+    print(f'  {"Equilibration":<28} {static["equil_duration"]:.0f}  time units  (pH 7)')
+    print(f'  {"β (inv. temperature)":<28} {static["beta"]:.2f}')
+    print(f'  {"k₀ (base rate)":<28} {static["k0"]:.2f}')
+    print('─' * W)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -320,21 +406,9 @@ def main():
             json.dump(params_out, f, indent=2)
         print(f'Saved trained params → {params_path}')
 
-        print('\n— Trained parameters —')
-        T_val = args.n_types
-        for i in range(args.n_species):
-            ab = 'base' if int(static['acid_base'][i * T_val]) == 1 else 'acid'
-            print(f'  {SPECIES_NAMES[i]} ({ab:<4s}): pKa = {float(p_eval["pKa"][i]):.3f}')
-        phi_tag = f' (fixed)' if args.fixed_phi is not None else ''
-        print(f'  φ = {float(p_eval["phi"]):.4f}{phi_tag}')
-        print(f'  J = {float(p_eval["J"]):.4f}  kT')
-        if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
-            s = np.atleast_1d(p_eval['monomer_entropy'])
-            if len(s) == 1:
-                print(f'  s (shared) = {float(s[0]):.4f}  kT  [s_i+s_j added to each ΔG_ij]')
-            else:
-                for i, sv in enumerate(s):
-                    print(f'  s({SPECIES_NAMES[i]}) = {float(sv):.4f}  kT')
+        _print_param_table(p_eval, static,
+                           fixed_phi=args.fixed_phi,
+                           title='Trained Parameters')
 
         target_sched = [float(x) for x in args.target_pH]
 
@@ -388,6 +462,17 @@ def main():
                   f'(got {len(args.eval_pKa)}) — set --n_species accordingly.')
             sys.exit(1)
 
+        n_pairs = args.n_species // 2
+        j_raw   = args.eval_J
+        if len(j_raw) == 1:
+            J_eval = float(j_raw[0])          # scalar: same J for all pairs
+        elif len(j_raw) == n_pairs:
+            J_eval = _build_J_matrix(j_raw, args.n_species, args.n_types)
+        else:
+            print(f'ERROR: --eval_J must have 1 value (same for all pairs) or '
+                  f'{n_pairs} values (one per correct pair). Got {len(j_raw)}.')
+            sys.exit(1)
+
         static = _static_dict(
             args.n_species, args.n_types,
             args.beta, args.k0,
@@ -401,7 +486,7 @@ def main():
         p_eval = {
             'pKa'            : np.array(args.eval_pKa),
             'phi'            : float(args.eval_phi),
-            'J'              : float(args.eval_J),
+            'J'              : J_eval,
             'monomer_entropy': mono_eval,
         }
         target_sched  = [float(x) for x in args.target_pH]
@@ -409,12 +494,14 @@ def main():
         target_idx    = all_schedules.index(target_sched)
         loss_history  = [0.0]
         score_history = None
+        # param_history stores scalar J for the evolution plots (trivially flat)
         param_history = [{'pKa': np.array(args.eval_pKa),
                           'phi': float(args.eval_phi),
-                          'J'  : float(args.eval_J)}]
+                          'J'  : _j_scalar_for_history(J_eval)}]
         print('=' * 60)
         print('CRN_AD  —  Eval (fixed parameters)')
         print('=' * 60)
+        _print_param_table(p_eval, static, title='Eval Parameters')
 
     # =====================================================================
     # SUMMARY PLOT
@@ -438,7 +525,7 @@ def main():
         trained_params = {
             'pKa'           : np.array(p_eval['pKa']),
             'phi'           : float(p_eval['phi']),
-            'J'             : float(p_eval['J']),
+            'J'             : p_eval['J'],          # scalar or N×N matrix
             'monomer_entropy': (np.atleast_1d(np.array(p_eval['monomer_entropy']))
                                 if p_eval.get('monomer_entropy') is not None else None),
         }
