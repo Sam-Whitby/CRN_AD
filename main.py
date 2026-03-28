@@ -31,6 +31,7 @@ import sys
 
 import numpy as np
 import jax
+jax.config.update("jax_enable_x64", True)   # must be before any JAX computation
 import jax.numpy as jnp
 import matplotlib
 matplotlib.use('Agg')
@@ -51,7 +52,10 @@ def build_parser():
         description='CRN_AD: pH-responsive Chemical Reaction Network trainer',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('--mode', choices=['train', 'animate', 'both'], default='train')
+    p.add_argument('--mode', choices=['train', 'animate', 'both', 'eval'], default='train',
+                   help='train: train and plot | animate: load saved params and plot | '
+                        'eval: plot for fully-specified parameters given on the CLI | '
+                        'both: train + animate')
     p.add_argument('--n_species', type=int, default=4,
                    help='Number of species types (even). E.g. 4 → A,B,C,D.')
     p.add_argument('--n_types', type=int, default=1,
@@ -107,6 +111,21 @@ def build_parser():
     p.add_argument('--fixed_phi', type=float, default=None,
                    help='If set, fix phi at this value in [0, 1] for the entire run '
                         'and do not train it.  If omitted, phi is a free parameter.')
+    # ---- Gradient clipping (JAX custom_vjp approach) ----
+    p.add_argument('--grad_clip', type=float, default=None,
+                   help='If set, clip the L2 norm of gradients flowing back through each '
+                        'ODE call to this value, using a JAX custom_vjp wrapper.  '
+                        'Helps prevent NaN gradients from the adjoint ODE.  '
+                        'Try 1.0–10.0; smaller = more aggressive clipping.')
+    # ---- Eval mode: specify all parameters explicitly ----
+    p.add_argument('--eval_pKa', nargs='+', type=float, default=None,
+                   help='(--mode eval) pKa values, one per species.')
+    p.add_argument('--eval_phi', type=float, default=None,
+                   help='(--mode eval) Steric mismatch factor φ ∈ [0, 1].')
+    p.add_argument('--eval_J', type=float, default=None,
+                   help='(--mode eval) Electrostatic coupling J (kT).')
+    p.add_argument('--eval_monomer_entropy', type=float, default=None,
+                   help='(--mode eval) Shared monomer entropy s (kT). Optional.')
     return p
 
 
@@ -262,6 +281,7 @@ def main():
             per_monomer_entropy  = args.per_monomer_entropy,
             specific_bonds       = args.specific_bonds,
             fixed_phi            = args.fixed_phi,
+            grad_clip            = args.grad_clip,
         )
 
         print('=' * 60)
@@ -354,9 +374,52 @@ def main():
         param_history = [{'pKa': p_eval['pKa'], 'phi': p_eval['phi'], 'J': p_eval['J']}]
 
     # =====================================================================
+    # EVAL — fully-specified parameters from CLI, no training
+    # =====================================================================
+    if args.mode == 'eval':
+        missing = [n for n, v in [('--eval_pKa', args.eval_pKa),
+                                   ('--eval_phi', args.eval_phi),
+                                   ('--eval_J',   args.eval_J)] if v is None]
+        if missing:
+            print(f'ERROR: --mode eval requires {", ".join(missing)}')
+            sys.exit(1)
+        if len(args.eval_pKa) != args.n_species:
+            print(f'ERROR: --eval_pKa must have exactly {args.n_species} values '
+                  f'(got {len(args.eval_pKa)}) — set --n_species accordingly.')
+            sys.exit(1)
+
+        static = _static_dict(
+            args.n_species, args.n_types,
+            args.beta, args.k0,
+            args.n_points_sim, args.n_points_equil,
+            args.equil_duration, args.tau,
+            args.J_max, args.S_max, args.smooth_width,
+            args.per_monomer_entropy, args.specific_bonds,
+        )
+        mono_eval = (np.array([args.eval_monomer_entropy])
+                     if args.eval_monomer_entropy is not None else None)
+        p_eval = {
+            'pKa'            : np.array(args.eval_pKa),
+            'phi'            : float(args.eval_phi),
+            'J'              : float(args.eval_J),
+            'monomer_entropy': mono_eval,
+        }
+        target_sched  = [float(x) for x in args.target_pH]
+        all_schedules = all_unique_permutations(target_sched)
+        target_idx    = all_schedules.index(target_sched)
+        loss_history  = [0.0]
+        score_history = None
+        param_history = [{'pKa': np.array(args.eval_pKa),
+                          'phi': float(args.eval_phi),
+                          'J'  : float(args.eval_J)}]
+        print('=' * 60)
+        print('CRN_AD  —  Eval (fixed parameters)')
+        print('=' * 60)
+
+    # =====================================================================
     # SUMMARY PLOT
     # =====================================================================
-    if args.mode in ('train', 'both', 'animate'):
+    if args.mode in ('train', 'both', 'animate', 'eval'):
         print('\nGenerating summary plot ...')
 
         equil_traj, schedule_trajs, _ = get_equil_and_schedule_traj(

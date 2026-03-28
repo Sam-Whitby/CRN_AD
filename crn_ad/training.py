@@ -25,6 +25,7 @@ NaN stability
    a silent plateau because the optimizer takes near-zero steps forever.
 """
 
+import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -34,6 +35,36 @@ from functools import partial
 
 from .dynamics import (simulate_schedule, simulate_schedule_scan,
                        make_initial_state, make_triu_indices)
+
+
+# ---------------------------------------------------------------------------
+# Gradient clipping via custom VJP
+# ---------------------------------------------------------------------------
+# Applied to the ODE output state so that the adjoint sensitivity that flows
+# *back through the ODE* starts with a bounded norm.  This is the approach
+# described in the JAX docs on custom derivative rules.
+#
+# Usage:  clipped_state = _clip_grad_norm(max_norm, state)
+#   - Forward pass:  identity (no change to values)
+#   - Backward pass: scale gradient so its L2 norm ≤ max_norm
+#
+# nondiff_argnums=(0,) makes max_norm a static Python float — it is captured
+# at trace time and never traced through.
+# ---------------------------------------------------------------------------
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
+def _clip_grad_norm(max_norm, x):
+    return x   # identity in the forward pass
+
+def _cgn_fwd(max_norm, x):
+    return x, None   # no residuals needed
+
+def _cgn_bwd(max_norm, _residuals, g):
+    norm  = jnp.sqrt(jnp.sum(g * g) + 1e-30)
+    scale = jnp.minimum(1.0, float(max_norm) / norm)
+    return (g * scale,)
+
+_clip_grad_norm.defvjp(_cgn_fwd, _cgn_bwd)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +174,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     T            = static.get('T', 1)
     allowed_mask = static.get('allowed_mask', None)
     equil_ramp   = float(static.get('equil_ramp_duration', 0.0))
+    grad_clip    = static.get('grad_clip', None)
     # Expand species-level pKa (n_species,) → particle-level (N,)
     pKa_full = jnp.repeat(p['pKa'], T) if T > 1 else p['pKa']
     # Expand per-species entropy (n_species,) → (N,) when T > 1
@@ -164,6 +196,9 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
         allowed_mask=allowed_mask,
         beta_ramp_duration=equil_ramp,
     )
+    # Clip gradient norm flowing back through the equil ODE adjoint.
+    if grad_clip is not None:
+        equil_state = _clip_grad_norm(float(grad_clip), equil_state)
 
     def score_one(pH_sched):
         final = simulate_schedule_scan(
@@ -178,6 +213,9 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
             ph_initial=7.0,
             allowed_mask=allowed_mask,
         )
+        # Clip gradient norm flowing back through each schedule ODE adjoint.
+        if grad_clip is not None:
+            final = _clip_grad_norm(float(grad_clip), final)
         return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
     scores = jax.vmap(score_one)(all_pH_schedules_array)
@@ -354,6 +392,8 @@ def train(config):
         'allowed_mask'       : allowed_mask_jax,
         'fixed_phi'          : fixed_phi_val,
         'equil_ramp_duration': float(config.get('equil_duration', 80.0)) / 2.0,
+        'grad_clip'          : (float(config['grad_clip'])
+                                if config.get('grad_clip') is not None else None),
     }
 
     # ------------------------------------------------------------------
