@@ -450,6 +450,25 @@ def plot_summary(loss_history, score_history, param_history,
     ax_conc.plot(t_all, M_t, 'k--', linewidth=2.0,
                  label='M(t) total (≡1)')
 
+    # Aggregate dimer lines
+    correct_triu   = [k for k, (ii, jj) in enumerate(zip(i_idx, j_idx))
+                      if correct_mask_np[ii, jj]]
+    incorrect_triu = [k for k, (ii, jj) in enumerate(zip(i_idx, j_idx))
+                      if not correct_mask_np[ii, jj]]
+    sum_correct    = (all_st[:, n:][:, correct_triu].sum(axis=1)
+                      if correct_triu else np.zeros(len(t_all)))
+    sum_incorrect  = (all_st[:, n:][:, incorrect_triu].sum(axis=1)
+                      if incorrect_triu else np.zeros(len(t_all)))
+    # Maximum possible: all monomer content in correct dimers → M/2
+    max_correct = M_t / 2.0
+
+    ax_conc.plot(t_all, sum_correct,   color='#27ae60', linewidth=3.5,
+                 label='Σ correct dimers', zorder=5)
+    ax_conc.plot(t_all, sum_incorrect, color='#e74c3c', linewidth=3.5,
+                 label='Σ incorrect dimers', zorder=5)
+    ax_conc.plot(t_all, max_correct,   color='#aaaaaa', linewidth=2.5,
+                 linestyle='--', label='max possible correct (M/2)', zorder=4)
+
     # Segment shading
     seg_colors = ['#2980b9', '#27ae60', '#c0392b', '#8e44ad', '#d35400']
     ax_conc.axvspan(0, equil_duration, alpha=0.04, color='grey')
