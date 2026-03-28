@@ -141,8 +141,8 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                          time units at the start of the segment (used for the
                          equilibration segment to avoid stiff transients).
     """
-    t_span = jnp.linspace(0.0, float(duration_per_seg), n_points)
-    _ramp  = float(beta_ramp_duration)
+    t_span = jnp.linspace(0.0, duration_per_seg, n_points)
+    _ramp  = beta_ramp_duration
 
     if smooth_width > 0.0:
         w = float(smooth_width)
@@ -154,8 +154,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
             def ode_fn(s, t, _pKa, _phi, _J, _pH_prev, _pH_target):
                 blend  = jax.nn.sigmoid((t - w * 0.5) / (w * 0.2 + 1e-8))
                 pH     = _pH_prev + (_pH_target - _pH_prev) * blend
-                beta_t = (jnp.where(t < _ramp, float(beta) * t / _ramp, float(beta))
-                          if _ramp > 0.0 else beta)
+                beta_t = jnp.where(t < _ramp, beta * t / (_ramp + 1e-30), beta)
                 return crn_ode(s, t, _pKa, acid_base, _phi, _J,
                                beta_t, k0, pH, correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask)
@@ -171,8 +170,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
     else:
         def segment_fn(state, pH):
             def ode_fn(s, t, _pKa, _phi, _J):
-                beta_t = (jnp.where(t < _ramp, float(beta) * t / _ramp, float(beta))
-                          if _ramp > 0.0 else beta)
+                beta_t = jnp.where(t < _ramp, beta * t / (_ramp + 1e-30), beta)
                 return crn_ode(s, t, _pKa, acid_base, _phi, _J,
                                beta_t, k0, pH, correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask)
