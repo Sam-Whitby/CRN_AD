@@ -170,10 +170,11 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                          S_max=static.get('S_max', 0.0),
                          fixed_phi=static.get('fixed_phi'))
     mono_s       = _get_monomer_entropy(p)
-    sw           = float(static.get('smooth_width', 0.0))
-    T            = static.get('T', 1)
-    allowed_mask = static.get('allowed_mask', None)
-    equil_ramp   = float(static.get('equil_ramp_duration', 0.0))
+    sw              = float(static.get('smooth_width', 0.0))
+    T               = static.get('T', 1)
+    allowed_mask    = static.get('allowed_mask', None)
+    no_self_bonds   = bool(static.get('no_self_bonds', False))
+    equil_ramp      = float(static.get('equil_ramp_duration', 0.0))
     grad_clip    = static.get('grad_clip', None)
     # Expand species-level pKa (n_species,) → particle-level (N,)
     pKa_full = jnp.repeat(p['pKa'], T) if T > 1 else p['pKa']
@@ -195,6 +196,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
         ph_initial=7.0,
         allowed_mask=allowed_mask,
         beta_ramp_duration=equil_ramp,
+        no_self_bonds=no_self_bonds,
     )
     # Clip gradient norm flowing back through the equil ODE adjoint.
     if grad_clip is not None:
@@ -212,6 +214,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
             monomer_entropy=mono_s,
             ph_initial=7.0,
             allowed_mask=allowed_mask,
+            no_self_bonds=no_self_bonds,
         )
         # Clip gradient norm flowing back through each schedule ODE adjoint.
         if grad_clip is not None:
@@ -245,8 +248,9 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     initial_state = make_initial_state(static['n'])
     sw            = float(static.get('smooth_width', 0.0))
 
-    T            = static.get('T', 1)
-    allowed_mask = static.get('allowed_mask', None)
+    T             = static.get('T', 1)
+    allowed_mask  = static.get('allowed_mask', None)
+    no_self_bonds = bool(static.get('no_self_bonds', False))
     pKa          = jnp.array(p_constrained['pKa'])
     pKa          = jnp.repeat(pKa, T) if T > 1 else pKa
     phi          = jnp.array(p_constrained['phi'])
@@ -273,6 +277,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
             ph_initial=7.0,
             allowed_mask=allowed_mask,
             beta_ramp_duration=equil_ramp,
+            no_self_bonds=no_self_bonds,
         )
 
         def score_one(pH_sched):
@@ -286,6 +291,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                 smooth_width=sw,
                 monomer_entropy=mono_s,
                 allowed_mask=allowed_mask,
+                no_self_bonds=no_self_bonds,
             )
             return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
@@ -332,6 +338,9 @@ def train(config):
     smooth         = float(config.get('smooth_width', 0.0))
     per_mono       = bool(config.get('per_monomer_entropy', False))
     specific_bonds = bool(config.get('specific_bonds', False))
+    no_self_bonds  = bool(config.get('no_self_bonds', False))
+    wide_init      = bool(config.get('wide_init', False))
+    verbose        = bool(config.get('verbose', True))
     fixed_phi_val  = config.get('fixed_phi', None)
     if fixed_phi_val is not None:
         fixed_phi_val = float(np.clip(fixed_phi_val, 0.0, 1.0))
@@ -393,6 +402,7 @@ def train(config):
         'smooth_width'       : smooth,
         'per_monomer_entropy': per_mono,
         'specific_bonds'     : specific_bonds,
+        'no_self_bonds'      : no_self_bonds,
         'allowed_mask'       : allowed_mask_jax,
         'fixed_phi'          : fixed_phi_val,
         'equil_ramp_duration': float(config.get('equil_duration', 80.0)) / 2.0,
@@ -412,31 +422,39 @@ def train(config):
     # entropy trained per species (shared across types of same species)
     n_entropy = n_species if per_mono else 1
     type_str  = f" × {T} types = {N} particles" if T > 1 else ""
-    print(f"Species      : {n_species}  ({n_species//2} correct pairs){type_str}")
-    print(f"Target sched : {target_sched}")
-    print(f"Permutations : {len(all_schedules)}  (target idx = {target_idx})")
-    print(f"Equilibration: pH 7,  t = {static['equil_duration']} (β=1)")
-    print(f"J_max        : {J_max}  kT")
-    print(f"Smooth width : {smooth}  ({'enabled' if smooth > 0 else 'disabled'})")
-    if S_max > 0:
-        mode = f"per-species ({n_species} values)" if per_mono else "shared (1 value)"
-        print(f"Entropy      : S_max = {S_max} kT, {mode}")
+    if verbose:
+        print(f"Species      : {n_species}  ({n_species//2} correct pairs){type_str}")
+        print(f"Target sched : {target_sched}")
+        print(f"Permutations : {len(all_schedules)}  (target idx = {target_idx})")
+        print(f"Equilibration: pH 7,  t = {static['equil_duration']} (β=1)")
+        print(f"J_max        : {J_max}  kT")
+        print(f"Smooth width : {smooth}  ({'enabled' if smooth > 0 else 'disabled'})")
+        if S_max > 0:
+            mode = f"per-species ({n_species} values)" if per_mono else "shared (1 value)"
+            print(f"Entropy      : S_max = {S_max} kT, {mode}")
 
     # ------------------------------------------------------------------
     # Initial parameters  (pKa: one per species, shared across types)
     # ------------------------------------------------------------------
-    rng    = np.random.default_rng(int(config.get('seed', 42)))
-    pH_min, pH_max = float(min(target_sched)), float(max(target_sched))
-    pKa_init = []
-    for i in range(n_species):
-        if i % 2 == 0:  # acid species
-            centre = np.clip(pH_min + 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
-        else:            # base species
-            centre = np.clip(pH_max - 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
-        pKa_init.append(float(centre))
+    rng = np.random.default_rng(int(config.get('seed', 42)))
 
-    phi_init = float(np.clip(0.2 + rng.normal(0.0, 0.05), 0.01, 0.99))
-    J_init   = float(np.clip(1.5 + rng.normal(0.0, 0.2),  0.51, J_max - 0.01))
+    if wide_init:
+        # Wide uniform sampling across the full valid range — used for
+        # multi-restart training to avoid converging to the same local minimum.
+        pKa_init = list(rng.uniform(3.1, 9.9, n_species))
+        phi_init = float(rng.uniform(0.05, 0.95))
+        J_init   = float(rng.uniform(0.55, J_max - 0.01))
+    else:
+        pH_min, pH_max = float(min(target_sched)), float(max(target_sched))
+        pKa_init = []
+        for i in range(n_species):
+            if i % 2 == 0:  # acid species
+                centre = np.clip(pH_min + 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
+            else:            # base species
+                centre = np.clip(pH_max - 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
+            pKa_init.append(float(centre))
+        phi_init = float(np.clip(0.2 + rng.normal(0.0, 0.05), 0.01, 0.99))
+        J_init   = float(np.clip(1.5 + rng.normal(0.0, 0.2),  0.51, J_max - 0.01))
 
     init_phys = {
         'pKa': jnp.array(pKa_init),
@@ -444,10 +462,13 @@ def train(config):
         'J'  : jnp.array(J_init),
     }
     if S_max > 0.0:
-        s_init = np.clip(
-            rng.uniform(0.0, 0.2 * S_max, n_entropy),
-            1e-4 * S_max, 0.999 * S_max,
-        )
+        if wide_init:
+            s_init = rng.uniform(0.01 * S_max, 0.5 * S_max, n_entropy)
+        else:
+            s_init = np.clip(
+                rng.uniform(0.0, 0.2 * S_max, n_entropy),
+                1e-4 * S_max, 0.999 * S_max,
+            )
         init_phys['monomer_entropy'] = jnp.array(s_init)
 
     raw_params = unconstrain_params(init_phys, J_max=J_max, S_max=S_max)
@@ -494,10 +515,12 @@ def train(config):
         new_raw_params = optax.apply_updates(raw_params, updates)
         return new_raw_params, new_opt_state, loss_val, scores
 
-    print("Compiling JAX graph (first call) ...", flush=True)
+    if verbose:
+        print("Compiling JAX graph (first call) ...", flush=True)
     lr_jax = jnp.array(lr)
     raw_params, opt_state, lv, sc = step(raw_params, opt_state, lr_jax)
-    print("Compilation done.\n")
+    if verbose:
+        print("Compilation done.\n")
 
     # ------------------------------------------------------------------
     # Training loop
@@ -515,9 +538,10 @@ def train(config):
         new_params, new_opt, lv, sc = step(raw_params, opt_state, lr_jax)
 
         if not (np.isfinite(float(lv)) and _params_finite(new_params)):
-            print(f"\nNaN encountered at epoch {epoch} — "
-                  f"stopping early and reporting results from epoch {epoch - 1}.",
-                  flush=True)
+            if verbose:
+                print(f"\nNaN encountered at epoch {epoch} — "
+                      f"stopping early and reporting results from epoch {epoch - 1}.",
+                      flush=True)
             nan_stopped = True
             break
 
@@ -529,7 +553,7 @@ def train(config):
         p_cur = constrain_params(raw_params, J_max=J_max, S_max=S_max)
         param_history.append(_snapshot(p_cur, S_max))
 
-        if epoch % max(1, n_epochs // 15) == 0 or epoch == n_epochs - 1:
+        if verbose and (epoch % max(1, n_epochs // 15) == 0 or epoch == n_epochs - 1):
             pKa_str = ' '.join(f'{float(v):.2f}' for v in p_cur['pKa'])
             s_str   = ''
             if S_max > 0.0 and 'monomer_entropy' in p_cur:
@@ -547,10 +571,11 @@ def train(config):
                 flush=True,
             )
 
-    if nan_stopped:
-        print("Training terminated early (NaN).")
-    else:
-        print("\nTraining complete.")
+    if verbose:
+        if nan_stopped:
+            print("Training terminated early (NaN).")
+        else:
+            print("\nTraining complete.")
 
     p_final  = constrain_params(raw_params, J_max=J_max, S_max=S_max)
     mono_s   = _get_monomer_entropy(p_final)
@@ -566,6 +591,7 @@ def train(config):
         smooth_width=smooth, monomer_entropy=mono_s, ph_initial=7.0,
         allowed_mask=allowed_mask_jax,
         beta_ramp_duration=static['equil_ramp_duration'],
+        no_self_bonds=no_self_bonds,
     )
 
     return (raw_params, loss_history, score_history, param_history,

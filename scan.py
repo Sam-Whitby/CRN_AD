@@ -62,7 +62,7 @@ from crn_ad.physics   import henderson_hasselbalch
 _FN_CACHE: dict = {}
 
 
-def _build_static(n_species, T, smooth_width, specific_bonds,
+def _build_static(n_species, T, smooth_width, specific_bonds, no_self_bonds,
                   n_pts_sim, n_pts_equil, target_sched):
     """Build the structural (non-swept) parts of the problem."""
     N = n_species * T
@@ -104,6 +104,7 @@ def _build_static(n_species, T, smooth_width, specific_bonds,
         'j_idx'           : j_idx,
         'correct_triu_idx': jnp.array(correct_triu_idx),
         'allowed_mask'    : allowed_mask,
+        'no_self_bonds'   : bool(no_self_bonds),
         'n_pts_sim'       : n_pts_sim,
         'n_pts_equil'     : n_pts_equil,
         'smooth_width'    : smooth_width,
@@ -132,6 +133,7 @@ def _get_jit_fn(cache_key, st, has_entropy, duration_py, equil_duration_py,
     sw            = float(st['smooth_width'])
     initial_state = make_initial_state(st['N'])
     allowed_mask  = st['allowed_mask']
+    no_self_bonds = bool(st['no_self_bonds'])
     all_pH_array  = st['all_pH_array']
     n             = st['N']
     acid_base     = st['acid_base']
@@ -160,6 +162,7 @@ def _get_jit_fn(cache_key, st, has_entropy, duration_py, equil_duration_py,
                 n_points=n_pts_equil, smooth_width=sw,
                 monomer_entropy=mono_s, ph_initial=7.0,
                 allowed_mask=allowed_mask, beta_ramp_duration=_eramp,
+                no_self_bonds=no_self_bonds,
             )
             def score_one(pH_sched):
                 final = simulate_schedule_scan(
@@ -168,6 +171,7 @@ def _get_jit_fn(cache_key, st, has_entropy, duration_py, equil_duration_py,
                     _beta, _k0, correct_mask, n, i_idx, j_idx,
                     n_points=n_pts_sim, smooth_width=sw,
                     monomer_entropy=mono_s, allowed_mask=allowed_mask,
+                    no_self_bonds=no_self_bonds,
                 )
                 return correct_bond_score(final, n, correct_tidx)
             return jax.vmap(score_one)(all_pH_array)
@@ -181,6 +185,7 @@ def _get_jit_fn(cache_key, st, has_entropy, duration_py, equil_duration_py,
                 n_points=n_pts_equil, smooth_width=sw,
                 monomer_entropy=None, ph_initial=7.0,
                 allowed_mask=allowed_mask, beta_ramp_duration=_eramp,
+                no_self_bonds=no_self_bonds,
             )
             def score_one(pH_sched):
                 final = simulate_schedule_scan(
@@ -189,6 +194,7 @@ def _get_jit_fn(cache_key, st, has_entropy, duration_py, equil_duration_py,
                     _beta, _k0, correct_mask, n, i_idx, j_idx,
                     n_points=n_pts_sim, smooth_width=sw,
                     monomer_entropy=None, allowed_mask=allowed_mask,
+                    no_self_bonds=no_self_bonds,
                 )
                 return correct_bond_score(final, n, correct_tidx)
             return jax.vmap(score_one)(all_pH_array)
@@ -269,7 +275,7 @@ def run_sweep(args):
 
         # Build / reuse the static structure for this (n_species, T, …)
         st_key = (n_species, T, tuple(target_sched),
-                  args.smooth_width, args.specific_bonds,
+                  args.smooth_width, args.specific_bonds, args.no_self_bonds,
                   args.n_points_sim, args.n_points_equil)
 
         # Scalar physics values are baked into each compiled function.
@@ -282,7 +288,8 @@ def run_sweep(args):
         if st_key not in run_sweep._st_cache:
             run_sweep._st_cache[st_key] = _build_static(
                 n_species, T, args.smooth_width, args.specific_bonds,
-                args.n_points_sim, args.n_points_equil, target_sched)
+                args.no_self_bonds, args.n_points_sim, args.n_points_equil,
+                target_sched)
         st = run_sweep._st_cache[st_key]
 
         has_entropy = S_max > 0.0
@@ -430,6 +437,9 @@ def build_parser():
     p.add_argument('--target_pH',    nargs='+',  type=float, default=[9.0, 5.0, 7.0])
     p.add_argument('--smooth_width', type=float, default=0.0)
     p.add_argument('--specific_bonds', action='store_true')
+    p.add_argument('--no_self_bonds', action='store_true',
+                   help='Zero interaction energy for identical-particle pairs '
+                        '(A-A, B-B, A1-A1, B2-B2 …).')
     p.add_argument('--n_points_sim',   type=int, default=40)
     p.add_argument('--n_points_equil', type=int, default=60)
     p.add_argument('--outdir', default='scan_outputs')

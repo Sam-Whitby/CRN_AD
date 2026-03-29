@@ -108,9 +108,18 @@ def build_parser():
                         'Equivalent to phi=0 between wrong-species pairs. '
                         'Within the correct species pair, phi still controls the '
                         'binding strength of type mismatches (A1-B2 etc.).')
+    p.add_argument('--no_self_bonds', action='store_true',
+                   help='If set, identical particles have zero interaction energy '
+                        '(ΔG=0 for A-A, B-B, etc.; or A1-A1, B2-B2 with n_types>1). '
+                        'Cross-type interactions (A1-A2, B1-B2, A1-B2 …) are unaffected.')
     p.add_argument('--fixed_phi', type=float, default=None,
                    help='If set, fix phi at this value in [0, 1] for the entire run '
                         'and do not train it.  If omitted, phi is a free parameter.')
+    p.add_argument('--n_restarts', type=int, default=1,
+                   help='Run training N times from different random starting points '
+                        '(wide uniform initialisation) and report the best result '
+                        '(lowest final loss).  Runs are parallelised via '
+                        'ProcessPoolExecutor when possible, otherwise sequential.')
     # ---- Gradient clipping (JAX custom_vjp approach) ----
     p.add_argument('--grad_clip', type=float, default=None,
                    help='If set, clip the L2 norm of gradients flowing back through each '
@@ -151,9 +160,41 @@ def open_file(path):
         pass
 
 
+def _run_one_restart(config_seed):
+    """Top-level worker for ProcessPoolExecutor — one training restart.
+
+    Defined at module level so it can be pickled by multiprocessing.
+    Returns a dict of numpy-serialisable results.
+    """
+    import jax as _jax
+    _jax.config.update("jax_enable_x64", True)
+    config, seed = config_seed
+    config = {**config, 'seed': seed, 'wide_init': True, 'verbose': False}
+    from crn_ad.training import train as _train, constrain_params as _cp
+    import numpy as _np
+
+    result = _train(config)
+    raw_params, loss_history, score_history, param_history, *_ = result
+    p = _cp(raw_params,
+            J_max=config.get('J_max', 3.5),
+            S_max=config.get('S_max', 0.0),
+            fixed_phi=config.get('fixed_phi'))
+    return {
+        'seed'         : seed,
+        'final_loss'   : float(loss_history[-1]),
+        'raw_params'   : {k: _np.array(v) for k, v in raw_params.items()},
+        'p_eval'       : {k: (_np.array(v) if hasattr(v, 'shape') else float(v))
+                          for k, v in p.items()},
+        'loss_history' : loss_history,
+        'score_history': [_np.array(s) for s in score_history],
+        'param_history': param_history,
+    }
+
+
 def _static_dict(n_species, T, beta, k0, n_points_sim, n_points_equil,
                  equil_duration, tau, J_max, S_max, smooth_width,
-                 per_monomer_entropy=False, specific_bonds=False):
+                 per_monomer_entropy=False, specific_bonds=False,
+                 no_self_bonds=False):
     N = n_species * T
     acid_base_np    = np.array([(k // T) % 2 for k in range(N)], dtype=int)
     correct_mask_np = np.zeros((N, N), dtype=bool)
@@ -201,6 +242,7 @@ def _static_dict(n_species, T, beta, k0, n_points_sim, n_points_equil,
         'smooth_width'        : float(smooth_width),
         'per_monomer_entropy' : bool(per_monomer_entropy),
         'specific_bonds'      : bool(specific_bonds),
+        'no_self_bonds'       : bool(no_self_bonds),
         'allowed_mask'        : allowed_mask_jax,
     }
 
@@ -209,8 +251,9 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
     """Run pH-7 equilibration then target schedule; return trajectories."""
     n            = static['n']
     T            = static.get('T', 1)
-    allowed_mask = static.get('allowed_mask', None)
-    mono_s       = _get_mono(p, static)
+    allowed_mask  = static.get('allowed_mask', None)
+    no_self_bonds = bool(static.get('no_self_bonds', False))
+    mono_s        = _get_mono(p, static)
 
     # Expand species-level pKa (n_species,) → particle-level (N,)
     pKa_arr  = jnp.array(p['pKa'])
@@ -229,6 +272,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
         monomer_entropy=mono_s,
         allowed_mask=allowed_mask,
         beta_ramp_duration=equil_ramp,
+        no_self_bonds=no_self_bonds,
     )
 
     final_state, schedule_trajs = simulate_schedule(
@@ -240,6 +284,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
         n_points=static['n_points_equil'],
         monomer_entropy=mono_s,
         allowed_mask=allowed_mask,
+        no_self_bonds=no_self_bonds,
     )
     return equil_traj[0], schedule_trajs, final_state
 
@@ -369,6 +414,7 @@ def main():
             S_max                = args.S_max,
             per_monomer_entropy  = args.per_monomer_entropy,
             specific_bonds       = args.specific_bonds,
+            no_self_bonds        = args.no_self_bonds,
             fixed_phi            = args.fixed_phi,
             grad_clip            = args.grad_clip,
         )
@@ -377,8 +423,38 @@ def main():
         print('CRN_AD  —  Training')
         print('=' * 60)
 
-        (raw_params, loss_history, score_history, param_history,
-         static, all_schedules, target_idx, _) = train(config)
+        n_restarts = int(args.n_restarts)
+
+        if n_restarts > 1:
+            print(f'Running {n_restarts} restarts from different random initialisations...')
+            seeds = [args.seed + i for i in range(n_restarts)]
+            pairs = [(config, s) for s in seeds]
+
+            try:
+                from concurrent.futures import ProcessPoolExecutor
+                print('  Using parallel execution (ProcessPoolExecutor) ...', flush=True)
+                with ProcessPoolExecutor() as executor:
+                    restart_results = list(executor.map(_run_one_restart, pairs))
+                print('  Parallel restarts complete.')
+            except Exception as exc:
+                print(f'  Parallel execution unavailable ({exc}); running sequentially.')
+                restart_results = [_run_one_restart(p) for p in pairs]
+
+            for r in restart_results:
+                print(f'  seed={r["seed"]}  final_loss={r["final_loss"]:.4f}')
+            best = min(restart_results, key=lambda r: r['final_loss'])
+            print(f'\nBest restart: seed={best["seed"]}  '
+                  f'final_loss={best["final_loss"]:.4f}')
+
+            # Re-run final training pass with verbose output using the best seed
+            print('\nRe-running best restart with full output ...')
+            best_config = {**config, 'seed': best['seed'],
+                           'wide_init': True, 'verbose': True}
+            (raw_params, loss_history, score_history, param_history,
+             static, all_schedules, target_idx, _) = train(best_config)
+        else:
+            (raw_params, loss_history, score_history, param_history,
+             static, all_schedules, target_idx, _) = train(config)
 
         p_eval = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max,
                                   fixed_phi=args.fixed_phi)
@@ -399,6 +475,7 @@ def main():
             'S_max'             : args.S_max,
             'per_monomer_entropy': args.per_monomer_entropy,
             'specific_bonds'     : args.specific_bonds,
+            'no_self_bonds'      : args.no_self_bonds,
             'fixed_phi'          : args.fixed_phi,
         }
         if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
@@ -429,12 +506,13 @@ def main():
         _permon = bool(pdata.get('per_monomer_entropy', False))
         _T      = int(pdata.get('n_types', 1))
         _specb  = bool(pdata.get('specific_bonds', False))
+        _nsb = bool(pdata.get('no_self_bonds', False))
         static = _static_dict(
             pdata['n_species'], _T,
             pdata['beta'], pdata['k0'],
             args.n_points_sim, args.n_points_equil,
             args.equil_duration, args.tau,
-            _J_max, _S_max, args.smooth_width, _permon, _specb,
+            _J_max, _S_max, args.smooth_width, _permon, _specb, _nsb,
         )
         p_eval = {
             'pKa': np.array(pdata['pKa']),
@@ -507,7 +585,7 @@ def main():
             args.n_points_sim, args.n_points_equil,
             args.equil_duration, args.tau,
             args.J_max, S_max_eval, args.smooth_width,
-            args.per_monomer_entropy, args.specific_bonds,
+            args.per_monomer_entropy, args.specific_bonds, args.no_self_bonds,
         )
         p_eval = {
             'pKa'            : np.array(args.eval_pKa),
