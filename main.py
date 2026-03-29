@@ -164,12 +164,13 @@ def _run_one_restart(config_seed):
     """Top-level worker for ProcessPoolExecutor — one training restart.
 
     Defined at module level so it can be pickled by multiprocessing.
+    config_seed is a (config, seed, wide_init) tuple.
     Returns a dict of numpy-serialisable results.
     """
     import jax as _jax
     _jax.config.update("jax_enable_x64", True)
-    config, seed = config_seed
-    config = {**config, 'seed': seed, 'wide_init': True, 'verbose': False}
+    config, seed, wide_init = config_seed
+    config = {**config, 'seed': seed, 'wide_init': wide_init, 'verbose': False}
     from crn_ad.training import train as _train, constrain_params as _cp
     import numpy as _np
 
@@ -181,6 +182,7 @@ def _run_one_restart(config_seed):
             fixed_phi=config.get('fixed_phi'))
     return {
         'seed'         : seed,
+        'wide_init'    : wide_init,
         'final_loss'   : float(loss_history[-1]),
         'raw_params'   : {k: _np.array(v) for k, v in raw_params.items()},
         'p_eval'       : {k: (_np.array(v) if hasattr(v, 'shape') else float(v))
@@ -427,8 +429,10 @@ def main():
 
         if n_restarts > 1:
             print(f'Running {n_restarts} restarts from different random initialisations...')
+            # Restart 0 uses the standard narrow initialisation (matches --n_restarts 1).
+            # Restarts 1..N-1 use wide uniform init to explore the full parameter space.
             seeds = [args.seed + i for i in range(n_restarts)]
-            pairs = [(config, s) for s in seeds]
+            pairs = [(config, s, i > 0) for i, s in enumerate(seeds)]
 
             try:
                 from concurrent.futures import ProcessPoolExecutor
@@ -441,15 +445,17 @@ def main():
                 restart_results = [_run_one_restart(p) for p in pairs]
 
             for r in restart_results:
-                print(f'  seed={r["seed"]}  final_loss={r["final_loss"]:.4f}')
+                init_tag = 'wide' if r['wide_init'] else 'standard'
+                print(f'  seed={r["seed"]}  ({init_tag} init)  final_loss={r["final_loss"]:.4f}')
             best = min(restart_results, key=lambda r: r['final_loss'])
             print(f'\nBest restart: seed={best["seed"]}  '
                   f'final_loss={best["final_loss"]:.4f}')
 
-            # Re-run final training pass with verbose output using the best seed
+            # Re-run the best restart with verbose output.  Use the same wide_init
+            # value so the trajectory is reproduced exactly.
             print('\nRe-running best restart with full output ...')
             best_config = {**config, 'seed': best['seed'],
-                           'wide_init': True, 'verbose': True}
+                           'wide_init': best['wide_init'], 'verbose': True}
             (raw_params, loss_history, score_history, param_history,
              static, all_schedules, target_idx, _) = train(best_config)
         else:
