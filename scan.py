@@ -113,15 +113,18 @@ def _build_static(n_species, T, smooth_width, specific_bonds,
     }
 
 
-def _get_jit_fn(cache_key, st, has_entropy):
+def _get_jit_fn(cache_key, st, has_entropy, duration_py, equil_duration_py,
+                equil_ramp_py, beta_py, k0_py):
     """
     Return (and cache) a JIT-compiled function:
 
-        fn(pKa_full, phi, J, mono_s, duration, equil_duration, equil_ramp,
-           beta, k0)  →  scores array  (n_schedules,)
+        fn(pKa_full, phi, J, mono_s)  →  scores array  (n_schedules,)
 
-    mono_s is only used when has_entropy=True; when False it is ignored
-    (the closure uses None).
+    Numeric scalars (duration, equil_duration, equil_ramp, beta, k0) are
+    baked into the compiled function as Python-level constants so that
+    simulate_schedule_scan receives plain Python floats for its internal
+    Python-if decisions (e.g. beta-ramp branch selection).  Different values
+    of these scalars produce different cache entries and compile separately.
     """
     if cache_key in _FN_CACHE:
         return _FN_CACHE[cache_key]
@@ -139,57 +142,53 @@ def _get_jit_fn(cache_key, st, has_entropy):
     n_pts_sim     = st['n_pts_sim']
     n_pts_equil   = st['n_pts_equil']
 
+    # Capture all Python-float scalars in the closure.
+    _dur      = float(duration_py)
+    _equil    = float(equil_duration_py)
+    _eramp    = float(equil_ramp_py)
+    _beta     = float(beta_py)
+    _k0       = float(k0_py)
+    _mono_kw  = dict(monomer_entropy=None)
+
     if has_entropy:
         @jax.jit
-        def _fn(pKa_full, phi, J, mono_s, duration, equil_duration, equil_ramp,
-                beta, k0):
+        def _fn(pKa_full, phi, J, mono_s):
             equil = simulate_schedule_scan(
-                initial_state, jnp.array([7.0]), equil_duration,
+                initial_state, jnp.array([7.0]), _equil,
                 pKa_full, acid_base, phi, J,
-                beta, k0, correct_mask, n, i_idx, j_idx,
-                n_points=n_pts_equil,
-                smooth_width=sw,
-                monomer_entropy=mono_s,
-                ph_initial=7.0,
-                allowed_mask=allowed_mask,
-                beta_ramp_duration=equil_ramp,
+                _beta, _k0, correct_mask, n, i_idx, j_idx,
+                n_points=n_pts_equil, smooth_width=sw,
+                monomer_entropy=mono_s, ph_initial=7.0,
+                allowed_mask=allowed_mask, beta_ramp_duration=_eramp,
             )
             def score_one(pH_sched):
                 final = simulate_schedule_scan(
-                    equil, pH_sched, duration,
+                    equil, pH_sched, _dur,
                     pKa_full, acid_base, phi, J,
-                    beta, k0, correct_mask, n, i_idx, j_idx,
-                    n_points=n_pts_sim,
-                    smooth_width=sw,
-                    monomer_entropy=mono_s,
-                    allowed_mask=allowed_mask,
+                    _beta, _k0, correct_mask, n, i_idx, j_idx,
+                    n_points=n_pts_sim, smooth_width=sw,
+                    monomer_entropy=mono_s, allowed_mask=allowed_mask,
                 )
                 return correct_bond_score(final, n, correct_tidx)
             return jax.vmap(score_one)(all_pH_array)
     else:
         @jax.jit
-        def _fn(pKa_full, phi, J, mono_s, duration, equil_duration, equil_ramp,
-                beta, k0):
+        def _fn(pKa_full, phi, J, mono_s):
             equil = simulate_schedule_scan(
-                initial_state, jnp.array([7.0]), equil_duration,
+                initial_state, jnp.array([7.0]), _equil,
                 pKa_full, acid_base, phi, J,
-                beta, k0, correct_mask, n, i_idx, j_idx,
-                n_points=n_pts_equil,
-                smooth_width=sw,
-                monomer_entropy=None,
-                ph_initial=7.0,
-                allowed_mask=allowed_mask,
-                beta_ramp_duration=equil_ramp,
+                _beta, _k0, correct_mask, n, i_idx, j_idx,
+                n_points=n_pts_equil, smooth_width=sw,
+                monomer_entropy=None, ph_initial=7.0,
+                allowed_mask=allowed_mask, beta_ramp_duration=_eramp,
             )
             def score_one(pH_sched):
                 final = simulate_schedule_scan(
-                    equil, pH_sched, duration,
+                    equil, pH_sched, _dur,
                     pKa_full, acid_base, phi, J,
-                    beta, k0, correct_mask, n, i_idx, j_idx,
-                    n_points=n_pts_sim,
-                    smooth_width=sw,
-                    monomer_entropy=None,
-                    allowed_mask=allowed_mask,
+                    _beta, _k0, correct_mask, n, i_idx, j_idx,
+                    n_points=n_pts_sim, smooth_width=sw,
+                    monomer_entropy=None, allowed_mask=allowed_mask,
                 )
                 return correct_bond_score(final, n, correct_tidx)
             return jax.vmap(score_one)(all_pH_array)
@@ -272,7 +271,11 @@ def run_sweep(args):
         st_key = (n_species, T, tuple(target_sched),
                   args.smooth_width, args.specific_bonds,
                   args.n_points_sim, args.n_points_equil)
-        cache_key = st_key + (S_max > 0.0,)   # JIT graph also differs on has_entropy
+
+        # Scalar physics values are baked into each compiled function.
+        equil_ramp = float(equil_dur) / 2.0
+        cache_key = st_key + (S_max > 0.0, float(dur), float(equil_dur),
+                               equil_ramp, float(beta), float(k0))
 
         if not hasattr(run_sweep, '_st_cache'):
             run_sweep._st_cache = {}
@@ -283,30 +286,24 @@ def run_sweep(args):
         st = run_sweep._st_cache[st_key]
 
         has_entropy = S_max > 0.0
-        fn = _get_jit_fn(cache_key, st, has_entropy)
+        fn = _get_jit_fn(cache_key, st, has_entropy,
+                         dur, equil_dur, equil_ramp, beta, k0)
 
-        # Build JAX inputs
+        # Build JAX inputs (only the truly swept arrays)
         pKa_np   = np.array(pKa_vals, dtype=float)
         pKa_full = jnp.repeat(jnp.array(pKa_np), T) if T > 1 else jnp.array(pKa_np)
-
-        mono_s = jnp.array([S_max]) if has_entropy else jnp.zeros(1)
-
-        equil_ramp = float(equil_dur) / 2.0
+        mono_s   = jnp.array([S_max]) if has_entropy else jnp.zeros(1)
 
         # Run (triggers JIT compilation on first call for this cache_key)
         if total_done == 0:
-            print(f'  Compiling JIT for cache_key={cache_key} ...', flush=True)
+            print(f'  Compiling JIT for cache_key={cache_key[:5]}... '
+                  f'dur={dur} equil={equil_dur} β={beta} k0={k0}', flush=True)
 
         scores = np.array(fn(
             pKa_full,
             jnp.array(phi),
             jnp.array(J),
             mono_s,
-            jnp.array(float(dur)),
-            jnp.array(float(equil_dur)),
-            jnp.array(equil_ramp),
-            jnp.array(float(beta)),
-            jnp.array(float(k0)),
         ))
 
         target_idx   = st['target_idx']

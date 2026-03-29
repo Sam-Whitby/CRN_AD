@@ -141,25 +141,34 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                          time units at the start of the segment (used for the
                          equilibration segment to avoid stiff transients).
     """
-    t_span = jnp.linspace(0.0, duration_per_seg, n_points)
-    _ramp  = beta_ramp_duration
+    t_span = jnp.linspace(0.0, float(duration_per_seg), n_points)
+    _ramp  = float(beta_ramp_duration)   # Python float — used in Python if below
 
     if smooth_width > 0.0:
         w = float(smooth_width)
         ph0 = pH_schedule_array[0] if ph_initial is None else jnp.array(float(ph_initial))
 
-        def segment_fn(carry, pH_target):
-            state, pH_prev = carry
-
-            def ode_fn(s, t, _pKa, _phi, _J, _pH_prev, _pH_target):
+        # Build the ODE function once, with the beta-ramp decision baked in at
+        # Python (trace) time so no dead-branch gradient blowup occurs.
+        if _ramp > 0.0:
+            def ode_fn_smooth(s, t, _pKa, _phi, _J, _pH_prev, _pH_target):
                 blend  = jax.nn.sigmoid((t - w * 0.5) / (w * 0.2 + 1e-8))
                 pH     = _pH_prev + (_pH_target - _pH_prev) * blend
-                beta_t = jnp.where(t < _ramp, beta * t / (_ramp + 1e-30), beta)
+                beta_t = jnp.where(t < _ramp, beta * t / _ramp, beta)
                 return crn_ode(s, t, _pKa, acid_base, _phi, _J,
                                beta_t, k0, pH, correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask)
+        else:
+            def ode_fn_smooth(s, t, _pKa, _phi, _J, _pH_prev, _pH_target):
+                blend  = jax.nn.sigmoid((t - w * 0.5) / (w * 0.2 + 1e-8))
+                pH     = _pH_prev + (_pH_target - _pH_prev) * blend
+                return crn_ode(s, t, _pKa, acid_base, _phi, _J,
+                               beta, k0, pH, correct_mask, n, i_idx, j_idx,
+                               monomer_entropy, allowed_mask)
 
-            traj = odeint(ode_fn, state, t_span,
+        def segment_fn(carry, pH_target):
+            state, pH_prev = carry
+            traj = odeint(ode_fn_smooth, state, t_span,
                           pKa, phi, J, pH_prev, pH_target,
                           rtol=1e-4, atol=1e-6, mxstep=1000)
             return (jnp.maximum(traj[-1], 0.0), pH_target), None
@@ -168,13 +177,21 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                                             (initial_state, ph0),
                                             pH_schedule_array)
     else:
-        def segment_fn(state, pH):
-            def ode_fn(s, t, _pKa, _phi, _J):
-                beta_t = jnp.where(t < _ramp, beta * t / (_ramp + 1e-30), beta)
+        # Build with beta-ramp decision baked in at Python (trace) time.
+        if _ramp > 0.0:
+            def ode_fn_flat(s, t, _pKa, _phi, _J, _pH):
+                beta_t = jnp.where(t < _ramp, beta * t / _ramp, beta)
                 return crn_ode(s, t, _pKa, acid_base, _phi, _J,
-                               beta_t, k0, pH, correct_mask, n, i_idx, j_idx,
+                               beta_t, k0, _pH, correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask)
-            traj = odeint(ode_fn, state, t_span, pKa, phi, J,
+        else:
+            def ode_fn_flat(s, t, _pKa, _phi, _J, _pH):
+                return crn_ode(s, t, _pKa, acid_base, _phi, _J,
+                               beta, k0, _pH, correct_mask, n, i_idx, j_idx,
+                               monomer_entropy, allowed_mask)
+
+        def segment_fn(state, pH):
+            traj = odeint(ode_fn_flat, state, t_span, pKa, phi, J, pH,
                           rtol=1e-4, atol=1e-6, mxstep=1000)
             return jnp.maximum(traj[-1], 0.0), None
 
