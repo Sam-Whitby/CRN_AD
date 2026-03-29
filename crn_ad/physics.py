@@ -22,8 +22,7 @@ def henderson_hasselbalch(pKa, pH, acid_base):
 
 
 def interaction_energy_matrix(charges, correct_mask, phi, J,
-                               monomer_entropy=None, allowed_mask=None,
-                               no_self_bonds=False):
+                               monomer_entropy=None, allowed_mask=None):
     """
     Free-energy matrix ΔG_{ij} for all monomer pairs.
 
@@ -61,13 +60,6 @@ def interaction_energy_matrix(charges, correct_mask, phi, J,
         # Broadcast scalar or per-monomer vector to length-n
         s  = jnp.broadcast_to(jnp.atleast_1d(monomer_entropy), (n,))
         dG = dG + s[:, None] + s[None, :]
-
-    if no_self_bonds:
-        # Zero out diagonal: identical particles (same index) have no interaction.
-        # This removes A-A, B-B, etc. (or A1-A1, B2-B2 with n_types > 1) while
-        # leaving cross-type interactions (A1-A2, B1-B2, A1-B2 …) unchanged.
-        n  = charges.shape[0]
-        dG = dG * (1.0 - jnp.eye(n))
 
     return dG
 

@@ -62,11 +62,16 @@ def crn_ode(state, t,
     charges    = henderson_hasselbalch(pKa, pH, acid_base)
     dG         = interaction_energy_matrix(charges, correct_mask, phi, J,
                                            monomer_entropy=monomer_entropy,
-                                           allowed_mask=allowed_mask,
-                                           no_self_bonds=no_self_bonds)
+                                           allowed_mask=allowed_mask)
     kf, kb     = rate_matrices(dG, beta, k0)
     dimer_full = triu_to_full(dimer_triu, n, i_idx, j_idx)
     flux       = kf * jnp.outer(free, free) - kb * dimer_full
+
+    if no_self_bonds:
+        # Zero diagonal flux entries: d[X_i·X_i]/dt = 0, so self-dimer
+        # concentrations stay at 0 forever (true absence of species, not
+        # merely zero energy).  Baked in at JAX trace time as a static branch.
+        flux = flux * (1.0 - jnp.eye(n))
 
     d_free       = -(jnp.sum(flux, axis=1) + jnp.diag(flux))
     d_dimer_triu = flux[i_idx, j_idx]
