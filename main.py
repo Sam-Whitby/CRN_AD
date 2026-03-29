@@ -117,9 +117,15 @@ def build_parser():
                         'and do not train it.  If omitted, phi is a free parameter.')
     p.add_argument('--n_restarts', type=int, default=1,
                    help='Run training N times from different random starting points '
-                        '(wide uniform initialisation) and report the best result '
-                        '(lowest final loss).  Runs are parallelised via '
-                        'ProcessPoolExecutor when possible, otherwise sequential.')
+                        'and report the best result (lowest final loss).  Runs are '
+                        'parallelised via ProcessPoolExecutor when possible, '
+                        'otherwise sequential.')
+    p.add_argument('--wide_init', action='store_true',
+                   help='If set, all restarts (including the first) use wide uniform '
+                        'initialisation: pKa ~ U[3.1, 9.9], φ ~ U[0.05, 0.95], '
+                        'J ~ U[0.55, J_max].  Without this flag, all restarts use '
+                        'the standard pH-guided initialisation (pKa centred near '
+                        'target pH, φ ~ 0.2, J ~ 1.5).')
     # ---- Gradient clipping (JAX custom_vjp approach) ----
     p.add_argument('--grad_clip', type=float, default=None,
                    help='If set, clip the L2 norm of gradients flowing back through each '
@@ -175,21 +181,25 @@ def _run_one_restart(config_seed):
     import numpy as _np
 
     result = _train(config)
-    raw_params, loss_history, score_history, param_history, *_ = result
+    (raw_params, loss_history, score_history, param_history,
+     *_, init_phys_np, nan_stopped) = result
     p = _cp(raw_params,
             J_max=config.get('J_max', 3.5),
             S_max=config.get('S_max', 0.0),
             fixed_phi=config.get('fixed_phi'))
     return {
-        'seed'         : seed,
-        'wide_init'    : wide_init,
-        'final_loss'   : float(loss_history[-1]),
-        'raw_params'   : {k: _np.array(v) for k, v in raw_params.items()},
-        'p_eval'       : {k: (_np.array(v) if hasattr(v, 'shape') else float(v))
-                          for k, v in p.items()},
-        'loss_history' : loss_history,
-        'score_history': [_np.array(s) for s in score_history],
-        'param_history': param_history,
+        'seed'              : seed,
+        'wide_init'         : wide_init,
+        'final_loss'        : float(loss_history[-1]),
+        'epochs_completed'  : len(loss_history),
+        'nan_stopped'       : bool(nan_stopped),
+        'init_params'       : init_phys_np,
+        'raw_params'        : {k: _np.array(v) for k, v in raw_params.items()},
+        'p_eval'            : {k: (_np.array(v) if hasattr(v, 'shape') else float(v))
+                               for k, v in p.items()},
+        'loss_history'      : loss_history,
+        'score_history'     : [_np.array(s) for s in score_history],
+        'param_history'     : param_history,
     }
 
 
@@ -417,6 +427,7 @@ def main():
             per_monomer_entropy  = args.per_monomer_entropy,
             specific_bonds       = args.specific_bonds,
             no_self_bonds        = args.no_self_bonds,
+            wide_init            = args.wide_init,
             fixed_phi            = args.fixed_phi,
             grad_clip            = args.grad_clip,
         )
@@ -428,39 +439,58 @@ def main():
         n_restarts = int(args.n_restarts)
 
         if n_restarts > 1:
-            print(f'Running {n_restarts} restarts from different random initialisations...')
-            # Restart 0 uses the standard narrow initialisation (matches --n_restarts 1).
-            # Restarts 1..N-1 use wide uniform init to explore the full parameter space.
+            init_tag = 'wide' if args.wide_init else 'standard'
+            print(f'Running {n_restarts} restarts ({init_tag} init) ...')
             seeds = [args.seed + i for i in range(n_restarts)]
-            pairs = [(config, s, i > 0) for i, s in enumerate(seeds)]
+            pairs = [(config, s, args.wide_init) for s in seeds]
 
             try:
                 from concurrent.futures import ProcessPoolExecutor
                 print('  Using parallel execution (ProcessPoolExecutor) ...', flush=True)
                 with ProcessPoolExecutor() as executor:
                     restart_results = list(executor.map(_run_one_restart, pairs))
-                print('  Parallel restarts complete.')
+                print('  Parallel restarts complete.\n')
             except Exception as exc:
-                print(f'  Parallel execution unavailable ({exc}); running sequentially.')
+                print(f'  Parallel execution unavailable ({exc}); running sequentially.\n')
                 restart_results = [_run_one_restart(p) for p in pairs]
 
+            # Print summary table
+            n_epochs_req = int(config['n_epochs'])
+            S_max_cfg    = float(config.get('S_max', 0.0))
+            print(f'  {"seed":>5}  {"init":>8}  {"start pKa":<{12 * config["n_species"] // 2}}  '
+                  f'{"φ":>5}  {"J":>5}'
+                  + (f'  {"s̄":>5}' if S_max_cfg > 0 else '')
+                  + f'  {"epochs":>11}  {"loss":>8}')
+            print('  ' + '─' * (70 + (8 if S_max_cfg > 0 else 0)))
             for r in restart_results:
-                init_tag = 'wide' if r['wide_init'] else 'standard'
-                print(f'  seed={r["seed"]}  ({init_tag} init)  final_loss={r["final_loss"]:.4f}')
+                ip       = r['init_params']
+                pKa_str  = ' '.join(f'{float(v):5.2f}' for v in ip['pKa'])
+                phi_str  = f'{float(ip["phi"]):5.3f}'
+                J_str    = f'{float(ip["J"]):5.3f}'
+                s_str    = (f'  {float(np.mean(ip["monomer_entropy"])):5.3f}'
+                            if S_max_cfg > 0 and 'monomer_entropy' in ip else
+                            (f'  {"—":>5}' if S_max_cfg > 0 else ''))
+                ep_str   = f'{r["epochs_completed"]:4d}/{n_epochs_req}'
+                nan_flag = '  [NaN stop]' if r['nan_stopped'] else ''
+                loss_str = f'{r["final_loss"]:8.4f}'
+                print(f'  {r["seed"]:>5}  {("wide" if r["wide_init"] else "std"):>8}'
+                      f'  pKa=[{pKa_str}]  φ={phi_str}  J={J_str}{s_str}'
+                      f'  {ep_str} epochs  {loss_str}{nan_flag}')
+
             best = min(restart_results, key=lambda r: r['final_loss'])
             print(f'\nBest restart: seed={best["seed"]}  '
                   f'final_loss={best["final_loss"]:.4f}')
 
             # Re-run the best restart with verbose output.  Use the same wide_init
-            # value so the trajectory is reproduced exactly.
+            # so the trajectory is reproduced exactly (same seed + same init strategy).
             print('\nRe-running best restart with full output ...')
             best_config = {**config, 'seed': best['seed'],
                            'wide_init': best['wide_init'], 'verbose': True}
             (raw_params, loss_history, score_history, param_history,
-             static, all_schedules, target_idx, _) = train(best_config)
+             static, all_schedules, target_idx, *_) = train(best_config)
         else:
             (raw_params, loss_history, score_history, param_history,
-             static, all_schedules, target_idx, _) = train(config)
+             static, all_schedules, target_idx, *_) = train(config)
 
         p_eval = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max,
                                   fixed_phi=args.fixed_phi)

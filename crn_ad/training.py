@@ -461,6 +461,8 @@ def train(config):
         'phi': jnp.array(phi_init),
         'J'  : jnp.array(J_init),
     }
+    # Snapshot the true starting params (before any gradient step) for reporting.
+    init_phys_np = {k: np.array(v) for k, v in init_phys.items()}
     if S_max > 0.0:
         if wide_init:
             s_init = rng.uniform(0.01 * S_max, 0.5 * S_max, n_entropy)
@@ -470,6 +472,7 @@ def train(config):
                 1e-4 * S_max, 0.999 * S_max,
             )
         init_phys['monomer_entropy'] = jnp.array(s_init)
+        init_phys_np['monomer_entropy'] = np.array(s_init)
 
     raw_params = unconstrain_params(init_phys, J_max=J_max, S_max=S_max)
 
@@ -595,7 +598,8 @@ def train(config):
     )
 
     return (raw_params, loss_history, score_history, param_history,
-            static, all_schedules, target_idx, equil_state)
+            static, all_schedules, target_idx, equil_state,
+            init_phys_np, nan_stopped)
 
 
 def _snapshot(p, S_max):
