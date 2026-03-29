@@ -220,6 +220,10 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
 
     scores = jax.vmap(score_one)(all_pH_schedules_array)
     tau    = static.get('tau', 5.0)
+    if scores.shape[0] == 1:
+        # Single schedule: softmax loss is identically 0 regardless of score.
+        # Use direct maximisation instead: loss = 1 - score.
+        return 1.0 - scores[0], scores
     log_p  = jax.nn.log_softmax(scores * tau)
     return -log_p[target_idx], scores
 
