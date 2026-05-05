@@ -363,6 +363,7 @@ def train(config):
     specific_bonds = bool(config.get('specific_bonds', False))
     no_self_bonds  = bool(config.get('no_self_bonds', False))
     wide_init      = bool(config.get('wide_init', False))
+    j_init_max     = bool(config.get('j_init_max', False))
     verbose        = bool(config.get('verbose', True))
     fixed_phi_val  = config.get('fixed_phi', None)
     if fixed_phi_val is not None:
@@ -451,6 +452,8 @@ def train(config):
         print(f"Permutations : {len(all_schedules)}  (target idx = {target_idx})")
         print(f"Equilibration: pH 7,  t = {static['equil_duration']} (β=1)")
         print(f"J_max        : {J_max}  kT")
+        if j_init_max:
+            print(f"J_init       : {J_max}  kT  (--J_init_max)")
         print(f"Smooth width : {smooth}  ({'enabled' if smooth > 0 else 'disabled'})")
         if S_max > 0:
             mode = f"per-species ({n_species} values)" if per_mono else "shared (1 value)"
@@ -478,6 +481,9 @@ def train(config):
             pKa_init.append(float(centre))
         phi_init = float(np.clip(0.2 + rng.normal(0.0, 0.05), 0.01, 0.99))
         J_init   = float(np.clip(1.5 + rng.normal(0.0, 0.2),  0.51, J_max - 0.01))
+
+    if j_init_max:
+        J_init = J_max   # unconstrain_params clips J_norm to 1-1e-4 if J_init == J_max
 
     init_phys = {
         'pKa': jnp.array(pKa_init),
