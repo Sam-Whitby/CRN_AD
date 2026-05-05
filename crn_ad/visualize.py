@@ -13,7 +13,7 @@ import matplotlib.ticker as ticker
 from matplotlib.colors import Normalize
 import string
 
-from .physics import henderson_hasselbalch
+from .physics import henderson_hasselbalch, interaction_energy_matrix
 import jax.numpy as jnp
 
 SPECIES_NAMES = list(string.ascii_uppercase)
@@ -297,6 +297,58 @@ def animate_crn(traj_list, n, acid_base, correct_mask_np,
 
 
 # ---------------------------------------------------------------------------
+# Boltzmann equilibrium helper
+# ---------------------------------------------------------------------------
+
+def _boltzmann_equilibrium(pH, pKa_full, acid_base_np, correct_mask_np,
+                            phi, J, beta, n, i_idx, j_idx,
+                            monomer_entropy=None, allowed_mask_np=None,
+                            no_self_bonds=False, n_iter=3000, tol=1e-12):
+    """Thermodynamic equilibrium concentrations via fixed-point iteration.
+
+    Solves  x_i = C_i / (1 + (K·x)_i + K_ii·x_i)  where K_ij = exp(-β·ΔG_ij)
+    and C_i = 1/N (uniform initial content).  Damped iteration (x ← ½(x + F(x)))
+    converges robustly even when K values are large.
+
+    Returns (sum_correct_dimers, sum_incorrect_dimers) at thermodynamic equilibrium.
+    """
+    charges = np.array(henderson_hasselbalch(
+        jnp.array(pKa_full, dtype=float), float(pH),
+        jnp.array(acid_base_np, dtype=float)))
+    me_jax = (jnp.array(monomer_entropy, dtype=float)
+              if monomer_entropy is not None else None)
+    am_jax = (jnp.array(allowed_mask_np, dtype=bool)
+              if allowed_mask_np is not None else None)
+    dG = np.array(interaction_energy_matrix(
+        jnp.array(charges, dtype=float),
+        jnp.array(correct_mask_np, dtype=bool),
+        float(phi),
+        jnp.array(J, dtype=float) if np.ndim(J) > 0 else float(J),
+        monomer_entropy=me_jax, allowed_mask=am_jax))
+    K = np.exp(-float(beta) * dG)
+    if no_self_bonds:
+        np.fill_diagonal(K, 0.0)
+    C = np.ones(n) / n
+    x = C.copy()
+    K_diag = np.diag(K).copy()
+    for _ in range(n_iter):
+        Fx = C / (1.0 + K.dot(x) + K_diag * x)
+        x_new = 0.5 * (x + Fx)  # damped: prevents oscillation when K is large
+        if np.max(np.abs(x_new - x)) < tol:
+            x = x_new
+            break
+        x = x_new
+    d_correct = d_incorrect = 0.0
+    for k, (ii, jj) in enumerate(zip(i_idx, j_idx)):
+        d_k = float(K[ii, jj]) * float(x[ii]) * float(x[jj])
+        if correct_mask_np[ii, jj]:
+            d_correct += d_k
+        else:
+            d_incorrect += d_k
+    return d_correct, d_incorrect
+
+
+# ---------------------------------------------------------------------------
 # Comprehensive summary PNG
 # ---------------------------------------------------------------------------
 
@@ -477,6 +529,55 @@ def plot_summary(loss_history, score_history, param_history,
         t1 = equil_duration + (s_i + 1) * duration_per_seg
         ax_conc.axvspan(t0, t1, alpha=0.07, color=seg_colors[s_i % len(seg_colors)])
     ax_conc.axvline(equil_duration, color='grey', linewidth=1.0, linestyle=':', alpha=0.6)
+
+    # --- Boltzmann thermodynamic equilibrium reference lines ----------------
+    # For each pH segment (including equilibration at pH 7), solve the
+    # mean-field equilibrium and overlay dotted horizontal lines so the user
+    # can see how far the ODE trajectory is from the thermodynamic limit.
+    _beta_eq = float(static.get('beta', 1.0))
+    _no_sb   = bool(static.get('no_self_bonds', False))
+    _am_eq   = (np.array(static['allowed_mask'])
+                if static.get('allowed_mask') is not None else None)
+    _phi_eq  = float(trained_params['phi'])
+    _J_eq    = trained_params['J']
+    _me_eq   = trained_params.get('monomer_entropy', None)
+    # Expand per-species entropy to per-particle when T > 1
+    if (_me_eq is not None
+            and static.get('per_monomer_entropy', False) and T > 1):
+        _me_eq = np.repeat(np.atleast_1d(np.array(_me_eq)), T)
+
+    ph_segs = [(7.0, 0.0, equil_duration)] + [
+        (float(pH_schedule[si]),
+         equil_duration + si * duration_per_seg,
+         equil_duration + (si + 1) * duration_per_seg)
+        for si in range(len(pH_schedule))]
+
+    _eq_legend_done = False
+    for ph_val, ts0, ts1 in ph_segs:
+        eq_c, eq_i = _boltzmann_equilibrium(
+            ph_val, pKa_full, acid_base, correct_mask_np,
+            _phi_eq, _J_eq, _beta_eq, n, i_idx, j_idx,
+            monomer_entropy=_me_eq, allowed_mask_np=_am_eq,
+            no_self_bonds=_no_sb)
+        lbl_c = 'Σ correct (thermo. eq.)'   if not _eq_legend_done else None
+        lbl_i = 'Σ incorrect (thermo. eq.)' if not _eq_legend_done else None
+        _eq_legend_done = True
+        x_mid = 0.5 * (ts0 + ts1)
+        ax_conc.plot([ts0, ts1], [eq_c, eq_c], color='#27ae60',
+                     linestyle=':', linewidth=2.0, zorder=6, alpha=0.85,
+                     label=lbl_c)
+        ax_conc.plot([ts0, ts1], [eq_i, eq_i], color='#e74c3c',
+                     linestyle=':', linewidth=2.0, zorder=6, alpha=0.85,
+                     label=lbl_i)
+        ax_conc.text(x_mid, eq_c, f'{eq_c:.3g}', color='#27ae60',
+                     fontsize=6.5, ha='center', va='bottom', zorder=7,
+                     bbox=dict(boxstyle='round,pad=0.1',
+                               facecolor='white', alpha=0.65, edgecolor='none'))
+        ax_conc.text(x_mid, eq_i, f'{eq_i:.3g}', color='#e74c3c',
+                     fontsize=6.5, ha='center', va='top', zorder=7,
+                     bbox=dict(boxstyle='round,pad=0.1',
+                               facecolor='white', alpha=0.65, edgecolor='none'))
+    # -----------------------------------------------------------------------
 
     ax_conc.set_xlabel('Time', fontsize=11)
     ax_conc.set_ylabel('Concentration (symlog)', fontsize=11)
