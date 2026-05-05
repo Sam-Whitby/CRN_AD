@@ -682,10 +682,13 @@ def main():
         print(f'\nSummary plot → {summary_path}')
         open_file(summary_path)
 
-        print('\n— Final scores (all schedules) —')
-        for i, (sched, sc) in enumerate(zip(all_schedules_local, final_scores)):
+        print('\n— Final scores —')
+        n_scheds = len(all_schedules_local)
+        for i, (sched, sc) in enumerate(zip(all_schedules_local, final_scores[:n_scheds])):
             marker = ' ← TARGET' if i == target_idx else ''
             print(f'  {sched}  →  {sc:.4f}{marker}')
+        if len(final_scores) > n_scheds:
+            print(f'  pH 7 (baseline)  →  {final_scores[n_scheds]:.4f}')
 
     # =====================================================================
     # OPTIONAL ANIMATIONS

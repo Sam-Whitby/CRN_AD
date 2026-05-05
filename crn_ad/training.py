@@ -160,10 +160,21 @@ def all_unique_permutations(seq):
 def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                  duration_per_seg, static, initial_state):
     """
-    Softmax cross-entropy loss.
+    Extended softmax cross-entropy loss with pH-7 baseline.
+
     1. Equilibrate at pH 7 with current parameters.
-    2. Score each schedule permutation from equilibrium via vmap.
-    3. Return −log_softmax(τ · scores)[target_idx].
+    2. Record the baseline score (correct-bond fraction at the equilibrated
+       pH-7 state — before any schedule is applied).
+    3. Score each schedule permutation from equilibrium via vmap.
+    4. Build all_scores = [sched_0, ..., sched_K, baseline] and return
+       −log_softmax(τ · all_scores)[target_idx].
+
+    The baseline is treated as an additional negative class alongside the
+    schedule permutations.  The global minimum (loss = 0) is achieved when
+    the target schedule score is strictly highest among all classes including
+    the baseline, so the optimiser is simultaneously rewarded for folding
+    under the target schedule and penalised for folding at pH 7 or under
+    any permutation.
     """
     p = constrain_params(raw_params,
                          J_max=static['J_max'],
@@ -202,6 +213,12 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     if grad_clip is not None:
         equil_state = _clip_grad_norm(float(grad_clip), equil_state)
 
+    # Baseline: correct-bond fraction at the pH-7 equilibrium state, before
+    # any schedule is applied.  Gradients flow back through this score so
+    # the optimiser is penalised for forming correct dimers at pH 7.
+    baseline_score = correct_bond_score(equil_state, static['n'],
+                                        static['correct_triu_idx'])
+
     def score_one(pH_sched):
         final = simulate_schedule_scan(
             equil_state, pH_sched, duration_per_seg,
@@ -223,12 +240,12 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
 
     scores = jax.vmap(score_one)(all_pH_schedules_array)
     tau    = static.get('tau', 5.0)
-    if scores.shape[0] == 1:
-        # Single schedule: softmax loss is identically 0 regardless of score.
-        # Use direct maximisation instead: loss = 1 - score.
-        return 1.0 - scores[0], scores
-    log_p  = jax.nn.log_softmax(scores * tau)
-    return -log_p[target_idx], scores
+
+    # Append baseline as the last entry.  all_scores shape: (n_schedules + 1,)
+    # target_idx still indexes into the first n_schedules entries unchanged.
+    all_scores = jnp.append(scores, baseline_score)
+    log_p      = jax.nn.log_softmax(all_scores * tau)
+    return -log_p[target_idx], all_scores
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +257,9 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     Score all schedules in parallel using vmap — same graph as training.
 
     p_constrained : dict with numpy/jax arrays for pKa, phi, J, monomer_entropy
-    Returns       : numpy array (n_schedules,)
+    Returns       : numpy array (n_schedules + 1,)
+                    First n_schedules entries are pH-schedule scores;
+                    last entry is the pH-7 baseline score.
 
     Compiles on first call; subsequent calls with same shapes are cached.
     """
@@ -280,6 +299,9 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
             no_self_bonds=no_self_bonds,
         )
 
+        baseline = correct_bond_score(equil, static['n'],
+                                      static['correct_triu_idx'])
+
         def score_one(pH_sched):
             final = simulate_schedule_scan(
                 equil, pH_sched, duration_per_seg,
@@ -295,7 +317,8 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
             )
             return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
-        return jax.vmap(score_one)(all_pH_array)
+        sched_scores = jax.vmap(score_one)(all_pH_array)
+        return jnp.append(sched_scores, baseline)
 
     return np.array(_score_all(pKa, phi, J, all_pH_array))
 
@@ -556,18 +579,23 @@ def train(config):
         param_history.append(_snapshot(p_cur, S_max))
 
         if verbose and (epoch % max(1, n_epochs // 15) == 0 or epoch == n_epochs - 1):
-            pKa_str = ' '.join(f'{float(v):.2f}' for v in p_cur['pKa'])
-            s_str   = ''
+            pKa_str    = ' '.join(f'{float(v):.2f}' for v in p_cur['pKa'])
+            s_str      = ''
             if S_max > 0.0 and 'monomer_entropy' in p_cur:
                 s = p_cur['monomer_entropy']
                 s_str = f' | s̄={float(jnp.mean(s)):.3f} sₘₐₓ={float(jnp.max(s)):.3f}'
-            phi_str = (f'{fixed_phi_val:.3f} (fixed)' if fixed_phi_val is not None
-                       else f'{float(p_cur["phi"]):.3f}')
+            phi_str    = (f'{fixed_phi_val:.3f} (fixed)' if fixed_phi_val is not None
+                          else f'{float(p_cur["phi"]):.3f}')
+            n_scheds   = len(all_schedules)
+            sched_sc   = sc[:n_scheds]
+            mean_other = float(jnp.mean(jnp.delete(sched_sc, target_idx)))
+            baseline   = float(sc[n_scheds])
             print(
                 f"Epoch {epoch:4d}/{n_epochs} | "
                 f"loss={float(lv):.4f} | "
                 f"target={float(sc[target_idx]):.3f} | "
-                f"mean_other={float(jnp.mean(jnp.delete(sc, target_idx))):.3f} | "
+                f"mean_other={mean_other:.3f} | "
+                f"baseline={baseline:.3f} | "
                 f"pKa=[{pKa_str}] | φ={phi_str} | "
                 f"J={float(p_cur['J']):.3f}{s_str}",
                 flush=True,

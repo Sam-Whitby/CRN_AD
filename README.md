@@ -51,9 +51,17 @@ State vector: free-monomer concentrations `[X_i]` and upper-triangle dimer conce
 ### Protocol
 
 1. Equilibrate at **pH 7** for `--equil_duration` time units (β ramps linearly from 0 to its full value over the first half of equilibration to avoid a stiff ODE transient).
-2. Run each unique permutation of the target pH schedule.
-3. Compute the *score* = fraction of total monomer content in correct dimers at the **final state**.
-4. Minimise softmax cross-entropy loss: `L = −log_softmax(τ · scores)[target_idx]`.
+2. Record the **baseline score**: correct-bond fraction at the end of the pH-7 equilibration (before any schedule is applied).
+3. Run each unique permutation of the target pH schedule from the equilibrated state.
+4. Compute the *score* = fraction of total monomer content in correct dimers at the **final state** of each schedule.
+5. Minimise the extended softmax cross-entropy loss:
+
+```
+all_scores = [sched_0, sched_1, ..., sched_K, baseline]
+L = −log_softmax(τ · all_scores)[target_idx]
+```
+
+The baseline is treated as an additional negative class alongside the schedule permutations. The global minimum (L = 0) is only achievable when the target schedule score is strictly highest among all classes, so the optimiser simultaneously rewards folding under the target schedule and penalises folding at pH 7 or under any permutation.
 
 ### Trainable parameters
 

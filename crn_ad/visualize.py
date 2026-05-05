@@ -563,27 +563,39 @@ def plot_summary(loss_history, score_history, param_history,
         ax_ent.grid(alpha=0.25)
 
     # -------------------------------------------------------------------
-    # Bar chart — all schedule permutations
+    # Bar chart — all schedule permutations + pH-7 baseline
+    # final_scores layout: [sched_0, ..., sched_K, baseline]
     # -------------------------------------------------------------------
-    xs         = np.arange(len(all_schedules))
-    colors_bar = ['#27ae60' if i == target_idx else '#e74c3c'
-                  for i in range(len(all_schedules))]
-    bars = ax_bar.bar(xs, final_scores, color=colors_bar, edgecolor='white', linewidth=0.5)
+    n_scheds      = len(all_schedules)
+    sched_scores  = final_scores[:n_scheds]
+    baseline_val  = float(final_scores[n_scheds]) if len(final_scores) > n_scheds else None
+
+    all_vals    = list(sched_scores) + ([baseline_val] if baseline_val is not None else [])
+    all_labels  = [str(s) for s in all_schedules] + (['pH 7 (baseline)'] if baseline_val is not None else [])
+    colors_bar  = ['#27ae60' if i == target_idx else '#e74c3c'
+                   for i in range(n_scheds)]
+    if baseline_val is not None:
+        colors_bar.append('#95a5a6')   # grey for baseline
+
+    xs   = np.arange(len(all_vals))
+    bars = ax_bar.bar(xs, all_vals, color=colors_bar, edgecolor='white', linewidth=0.5)
     ax_bar.set_xticks(xs)
-    ax_bar.set_xticklabels([str(s) for s in all_schedules],
-                            rotation=40, ha='right', fontsize=9)
+    ax_bar.set_xticklabels(all_labels, rotation=40, ha='right', fontsize=9)
     ax_bar.set_ylabel('Correct-bond fraction', fontsize=11)
-    ax_bar.set_title('Response to all pH-schedule permutations  '
-                     '(green = target, red = others)', fontsize=12)
-    ax_bar.set_ylim(0, min(1.05, max(final_scores) * 1.25 + 0.02))
+    ax_bar.set_title('Response to all pH-schedule permutations and pH-7 baseline  '
+                     '(green = target, red = others, grey = baseline)', fontsize=12)
+    ax_bar.set_ylim(0, min(1.05, max(all_vals) * 1.25 + 0.02))
     ax_bar.grid(axis='y', alpha=0.25)
-    for b, v in zip(bars, final_scores):
+    for b, v in zip(bars, all_vals):
         ax_bar.text(b.get_x() + b.get_width() / 2, v + 0.002,
                     f'{v:.3f}', ha='center', va='bottom', fontsize=9)
-    ax_bar.legend(handles=[
+    legend_handles = [
         mpatches.Patch(color='#27ae60', label='Target schedule'),
         mpatches.Patch(color='#e74c3c', label='Other permutations'),
-    ], fontsize=9)
+    ]
+    if baseline_val is not None:
+        legend_handles.append(mpatches.Patch(color='#95a5a6', label='pH 7 baseline'))
+    ax_bar.legend(handles=legend_handles, fontsize=9)
 
     fig.suptitle('CRN_AD — Training Summary', fontsize=15, fontweight='bold')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
