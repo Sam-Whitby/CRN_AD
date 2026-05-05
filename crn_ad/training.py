@@ -555,7 +555,7 @@ def train(config):
     loss_history  = [float(lv)]
     score_history = [np.array(sc)]
 
-    p0 = constrain_params(raw_params, J_max=J_max, S_max=S_max)
+    p0 = constrain_params(raw_params, J_max=J_max, S_max=S_max, fixed_phi=fixed_phi_val)
     param_history = [_snapshot(p0, S_max)]
 
     nan_stopped = False
@@ -575,7 +575,7 @@ def train(config):
 
         loss_history.append(float(lv))
         score_history.append(np.array(sc))
-        p_cur = constrain_params(raw_params, J_max=J_max, S_max=S_max)
+        p_cur = constrain_params(raw_params, J_max=J_max, S_max=S_max, fixed_phi=fixed_phi_val)
         param_history.append(_snapshot(p_cur, S_max))
 
         if verbose and (epoch % max(1, n_epochs // 15) == 0 or epoch == n_epochs - 1):
@@ -607,7 +607,7 @@ def train(config):
         else:
             print("\nTraining complete.")
 
-    p_final  = constrain_params(raw_params, J_max=J_max, S_max=S_max)
+    p_final  = constrain_params(raw_params, J_max=J_max, S_max=S_max, fixed_phi=fixed_phi_val)
     mono_s   = _get_monomer_entropy(p_final)
     pKa_full = jnp.repeat(p_final['pKa'], T) if T > 1 else p_final['pKa']
     if mono_s is not None and per_mono and T > 1:
