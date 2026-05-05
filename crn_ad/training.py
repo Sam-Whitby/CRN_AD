@@ -476,12 +476,11 @@ def train(config):
 
     raw_params = unconstrain_params(init_phys, J_max=J_max, S_max=S_max)
 
-    # Perturb initial free-monomer concentrations (±20 % multiplicative noise),
-    # then renormalise so total monomer content M = 1 is preserved.
-    free_init  = np.ones(N) / N * rng.uniform(0.8, 1.2, N)
-    free_init /= free_init.sum()
-    n_dimers   = N * (N + 1) // 2
-    initial_state = jnp.concatenate([jnp.array(free_init), jnp.zeros(n_dimers)])
+    # All monomers free at equal concentration, no dimers: this is the fully
+    # unattached state used as the starting point before every equilibration.
+    # Fixed for the entire training run — every gradient step recomputes from
+    # here, so there is no state carry-over between epochs.
+    initial_state = make_initial_state(N)
 
     # ------------------------------------------------------------------
     # Optimiser  (lr passed as traced JAX array — no recompile on change)
