@@ -130,6 +130,10 @@ def build_parser():
                    help='If set, initialise J at J_max rather than the default ~1.5 kT. '
                         'Overrides both standard and --wide_init J sampling. '
                         'Intended to explore solutions with high kinetic frustration.')
+    p.add_argument('--phi_init_max', action='store_true',
+                   help='If set, initialise φ at 1.0 (maximum steric mismatch penalty) '
+                        'rather than the default ~0.2. Overrides both standard and '
+                        '--wide_init φ sampling.')
     # ---- Gradient clipping (JAX custom_vjp approach) ----
     p.add_argument('--grad_clip', type=float, default=None,
                    help='If set, clip the L2 norm of gradients flowing back through each '
@@ -433,6 +437,7 @@ def main():
             no_self_bonds        = args.no_self_bonds,
             wide_init            = args.wide_init,
             j_init_max           = args.J_init_max,
+            phi_init_max         = args.phi_init_max,
             fixed_phi            = args.fixed_phi,
             grad_clip            = args.grad_clip,
         )

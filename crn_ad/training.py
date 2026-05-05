@@ -364,6 +364,7 @@ def train(config):
     no_self_bonds  = bool(config.get('no_self_bonds', False))
     wide_init      = bool(config.get('wide_init', False))
     j_init_max     = bool(config.get('j_init_max', False))
+    phi_init_max   = bool(config.get('phi_init_max', False))
     verbose        = bool(config.get('verbose', True))
     fixed_phi_val  = config.get('fixed_phi', None)
     if fixed_phi_val is not None:
@@ -454,6 +455,8 @@ def train(config):
         print(f"J_max        : {J_max}  kT")
         if j_init_max:
             print(f"J_init       : {J_max}  kT  (--J_init_max)")
+        if phi_init_max:
+            print(f"phi_init     : 1.0  (--phi_init_max)")
         print(f"Smooth width : {smooth}  ({'enabled' if smooth > 0 else 'disabled'})")
         if S_max > 0:
             mode = f"per-species ({n_species} values)" if per_mono else "shared (1 value)"
@@ -484,6 +487,8 @@ def train(config):
 
     if j_init_max:
         J_init = J_max   # unconstrain_params clips J_norm to 1-1e-4 if J_init == J_max
+    if phi_init_max:
+        phi_init = 1.0   # unconstrain_params clips phi_norm to 1-1e-4
 
     init_phys = {
         'pKa': jnp.array(pKa_init),
