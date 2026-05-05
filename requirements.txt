@@ -1,5 +1,6 @@
-jax>=0.4.20
-jaxlib>=0.4.20
+jax>=0.4.38
+jaxlib>=0.4.38
+diffrax>=0.6.0
 optax>=0.1.7
 numpy>=1.24
 matplotlib>=3.7

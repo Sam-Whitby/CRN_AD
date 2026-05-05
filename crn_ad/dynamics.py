@@ -16,19 +16,26 @@ Reactions
 
 Non-negativity
 --------------
-  The RHS clips state to ≥ 0 before computing fluxes, and every odeint
+  The RHS clips state to ≥ 0 before computing fluxes, and every ODE
   output is projected via jnp.maximum(state, 0) before being carried
   forward.  Both operations are differentiable through JAX autodiff.
 
 Conservation
 ------------
   Σ_i [X_i] + 2 · Σ_{i≤j} [X_i X_j] = const
+
+ODE solver
+----------
+  Uses Diffrax (Tsit5 adaptive solver) with RecursiveCheckpointAdjoint.
+  RecursiveCheckpointAdjoint stores checkpoints of the forward trajectory
+  and differentiates through them directly, avoiding the classical adjoint
+  ODE solve backwards in time that causes NaN for stiff systems.
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.ode import odeint
+import diffrax
 
 from .physics import henderson_hasselbalch, interaction_energy_matrix, rate_matrices
 
@@ -89,23 +96,36 @@ def simulate_segment(state, pH, duration,
     first beta_ramp_duration time units, then stays at beta.  Used for the
     equilibration segment to avoid a sharp-switch ODE transient.
     """
-    t_span = jnp.linspace(0.0, float(duration), n_points)
-    if beta_ramp_duration > 0.0:
-        _ramp = float(beta_ramp_duration)
-        def ode_fn(s, t, _pKa, _phi, _J):
+    t0    = 0.0
+    t1    = float(duration)
+    dt0   = t1 / max(n_points - 1, 1)
+    ts    = jnp.linspace(t0, t1, n_points)
+    _ramp = float(beta_ramp_duration)
+
+    if _ramp > 0.0:
+        def vf(t, s, _args):
             beta_t = jnp.where(t < _ramp, float(beta) * t / _ramp, float(beta))
-            return crn_ode(s, t, _pKa, acid_base, _phi, _J,
-                           beta_t, k0, pH, correct_mask, n, i_idx, j_idx,
+            return crn_ode(s, t, pKa, acid_base, phi, J, beta_t, k0, float(pH),
+                           correct_mask, n, i_idx, j_idx,
                            monomer_entropy, allowed_mask, no_self_bonds)
     else:
-        def ode_fn(s, t, _pKa, _phi, _J):
-            return crn_ode(s, t, _pKa, acid_base, _phi, _J,
-                           beta, k0, pH, correct_mask, n, i_idx, j_idx,
+        def vf(t, s, _args):
+            return crn_ode(s, t, pKa, acid_base, phi, J, float(beta), k0, float(pH),
+                           correct_mask, n, i_idx, j_idx,
                            monomer_entropy, allowed_mask, no_self_bonds)
-    traj = odeint(ode_fn, state, t_span, pKa, phi, J,
-                  rtol=1e-4, atol=1e-6, mxstep=1000)
-    # Clip to non-negative: odeint can drift slightly below zero due to
-    # numerical error even though the RHS already clips when computing flux.
+
+    sol = diffrax.diffeqsolve(
+        diffrax.ODETerm(vf),
+        diffrax.Tsit5(),
+        t0=t0, t1=t1, dt0=dt0,
+        y0=state,
+        args=None,
+        saveat=diffrax.SaveAt(ts=ts),
+        stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
+        max_steps=4096,
+        adjoint=diffrax.RecursiveCheckpointAdjoint(),
+    )
+    traj  = sol.ys                       # (n_points, state_size)
     final = jnp.maximum(traj[-1], 0.0)
     return final, traj
 
@@ -148,37 +168,49 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                          time units at the start of the segment (used for the
                          equilibration segment to avoid stiff transients).
     """
-    t_span = jnp.linspace(0.0, float(duration_per_seg), n_points)
-    _ramp  = float(beta_ramp_duration)   # Python float — used in Python if below
+    t0    = 0.0
+    t1    = float(duration_per_seg)
+    dt0   = t1 / max(n_points - 1, 1)
+    _ramp = float(beta_ramp_duration)
 
     if smooth_width > 0.0:
-        w = float(smooth_width)
+        w   = float(smooth_width)
         ph0 = pH_schedule_array[0] if ph_initial is None else jnp.array(float(ph_initial))
 
-        # Build the ODE function once, with the beta-ramp decision baked in at
+        # Build the vector field once, with the beta-ramp decision baked in at
         # Python (trace) time so no dead-branch gradient blowup occurs.
         if _ramp > 0.0:
-            def ode_fn_smooth(s, t, _pKa, _phi, _J, _pH_prev, _pH_target):
+            def vf(t, s, ph_args):
+                _pH_prev, _pH_target = ph_args
                 blend  = jax.nn.sigmoid((t - w * 0.5) / (w * 0.2 + 1e-8))
                 pH     = _pH_prev + (_pH_target - _pH_prev) * blend
-                beta_t = jnp.where(t < _ramp, beta * t / _ramp, beta)
-                return crn_ode(s, t, _pKa, acid_base, _phi, _J,
-                               beta_t, k0, pH, correct_mask, n, i_idx, j_idx,
+                beta_t = jnp.where(t < _ramp, float(beta) * t / _ramp, float(beta))
+                return crn_ode(s, t, pKa, acid_base, phi, J, beta_t, k0, pH,
+                               correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds)
         else:
-            def ode_fn_smooth(s, t, _pKa, _phi, _J, _pH_prev, _pH_target):
-                blend  = jax.nn.sigmoid((t - w * 0.5) / (w * 0.2 + 1e-8))
-                pH     = _pH_prev + (_pH_target - _pH_prev) * blend
-                return crn_ode(s, t, _pKa, acid_base, _phi, _J,
-                               beta, k0, pH, correct_mask, n, i_idx, j_idx,
+            def vf(t, s, ph_args):
+                _pH_prev, _pH_target = ph_args
+                blend = jax.nn.sigmoid((t - w * 0.5) / (w * 0.2 + 1e-8))
+                pH    = _pH_prev + (_pH_target - _pH_prev) * blend
+                return crn_ode(s, t, pKa, acid_base, phi, J, float(beta), k0, pH,
+                               correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds)
 
         def segment_fn(carry, pH_target):
             state, pH_prev = carry
-            traj = odeint(ode_fn_smooth, state, t_span,
-                          pKa, phi, J, pH_prev, pH_target,
-                          rtol=1e-4, atol=1e-6, mxstep=1000)
-            return (jnp.maximum(traj[-1], 0.0), pH_target), None
+            sol = diffrax.diffeqsolve(
+                diffrax.ODETerm(vf),
+                diffrax.Tsit5(),
+                t0=t0, t1=t1, dt0=dt0,
+                y0=state,
+                args=(pH_prev, pH_target),
+                saveat=diffrax.SaveAt(t1=True),
+                stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
+                max_steps=4096,
+                adjoint=diffrax.RecursiveCheckpointAdjoint(),
+            )
+            return (jnp.maximum(sol.ys[0], 0.0), pH_target), None
 
         (final_state, _), _ = jax.lax.scan(segment_fn,
                                             (initial_state, ph0),
@@ -186,21 +218,30 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
     else:
         # Build with beta-ramp decision baked in at Python (trace) time.
         if _ramp > 0.0:
-            def ode_fn_flat(s, t, _pKa, _phi, _J, _pH):
-                beta_t = jnp.where(t < _ramp, beta * t / _ramp, beta)
-                return crn_ode(s, t, _pKa, acid_base, _phi, _J,
-                               beta_t, k0, _pH, correct_mask, n, i_idx, j_idx,
+            def vf(t, s, pH):
+                beta_t = jnp.where(t < _ramp, float(beta) * t / _ramp, float(beta))
+                return crn_ode(s, t, pKa, acid_base, phi, J, beta_t, k0, pH,
+                               correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds)
         else:
-            def ode_fn_flat(s, t, _pKa, _phi, _J, _pH):
-                return crn_ode(s, t, _pKa, acid_base, _phi, _J,
-                               beta, k0, _pH, correct_mask, n, i_idx, j_idx,
+            def vf(t, s, pH):
+                return crn_ode(s, t, pKa, acid_base, phi, J, float(beta), k0, pH,
+                               correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds)
 
         def segment_fn(state, pH):
-            traj = odeint(ode_fn_flat, state, t_span, pKa, phi, J, pH,
-                          rtol=1e-4, atol=1e-6, mxstep=1000)
-            return jnp.maximum(traj[-1], 0.0), None
+            sol = diffrax.diffeqsolve(
+                diffrax.ODETerm(vf),
+                diffrax.Tsit5(),
+                t0=t0, t1=t1, dt0=dt0,
+                y0=state,
+                args=pH,
+                saveat=diffrax.SaveAt(t1=True),
+                stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
+                max_steps=4096,
+                adjoint=diffrax.RecursiveCheckpointAdjoint(),
+            )
+            return jnp.maximum(sol.ys[0], 0.0), None
 
         final_state, _ = jax.lax.scan(segment_fn, initial_state, pH_schedule_array)
 

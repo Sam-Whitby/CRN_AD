@@ -66,6 +66,10 @@ State vector: free-monomer concentrations `[X_i]` and upper-triangle dimer conce
 
 All constraints are enforced via sigmoid reparameterisations.
 
+### Numerical stability
+
+The ODE solver uses [Diffrax](https://docs.kidger.site/diffrax/) (Tsit5 adaptive solver) with `RecursiveCheckpointAdjoint`. This stores checkpoints of the forward trajectory and differentiates through them directly, rather than solving a new ODE backwards in time (the classical adjoint method that causes NaN in stiff systems). All computations run in float64. Together these eliminate the NaN instability that affects classical adjoint-based ODE training.
+
 ---
 
 ## Installation
@@ -112,7 +116,7 @@ python main.py --n_types 2 --no_self_bonds
 python main.py --specific_bonds
 ```
 
-### Larger J with smooth pH transitions (recommended for J_max > 3.5 or lr > 0.05)
+### Larger J with smooth pH transitions
 ```bash
 python main.py --J_max 5.0 --smooth_width 2.0
 ```
@@ -151,11 +155,15 @@ Core
   --n_restarts         Restarts from diverse starting points; best   [1]
                        result (lowest loss) is reported.
 
-ODE stability
+ODE options
   --J_max              Hard cap on coupling constant J (kT)          [3.5]
+                       Larger values allow stronger binding but make
+                       the ODE more stiff; raise alongside smooth_width.
   --smooth_width       Sigmoid ramp width at each pH transition      [0.0]
-                       0 = step function; 1–3 recommended for J_max > 3.5.
-  --grad_clip          Clip ODE adjoint gradient L2-norm to VALUE    [off]
+                       0 = step function; 1–3 useful for J_max > 3.5.
+  --grad_clip          Clip ODE output gradient L2-norm to VALUE     [off]
+                       Rarely needed with the Diffrax solver; try
+                       1.0–10.0 if loss becomes erratic at high J_max.
 
 Physics flags
   --specific_bonds     Only correct-species pairs interact           [off]
@@ -168,8 +176,8 @@ Conformational entropy
   --per_monomer_entropy Train a separate s_i per species              [off]
 
 Simulation accuracy
-  --n_points_sim       ODE time points per segment (train)           [40]
-  --n_points_equil     ODE time points for equilibration             [60]
+  --n_points_sim       ODE save points per segment (train)           [40]
+  --n_points_equil     ODE save points for equilibration             [60]
 
 Output
   --outdir             Output directory                              [outputs]
@@ -214,7 +222,7 @@ Outputs `scan_results.csv` and `scan_plot.png`. Supports `--no_self_bonds` and a
 CRN_AD/
 ├── crn_ad/
 │   ├── physics.py    Henderson-Hasselbalch charges, interaction energies, rate matrices
-│   ├── dynamics.py   ODE system, simulation (segment + lax.scan schedule)
+│   ├── dynamics.py   ODE system (Diffrax/Tsit5), simulation (segment + lax.scan schedule)
 │   ├── training.py   Loss function, parameter constraints, training loop
 │   └── visualize.py  Summary plot (training curve, scores, concentrations, pH trace)
 ├── main.py           CLI entry point (train, eval, animate)
