@@ -386,7 +386,7 @@ def train(config):
         fixed_phi_val = float(np.clip(fixed_phi_val, 0.0, 1.0))
     fixed_J_val    = config.get('fixed_J', None)
     if fixed_J_val is not None:
-        fixed_J_val = float(np.clip(fixed_J_val, 0.5, J_max))
+        fixed_J_val = float(fixed_J_val)   # no upper clip — fixed J bypasses J_max
     pka_default    = bool(config.get('pka_default', False))
     pKa_acid       = float(config.get('pKa_acid', 6.0))
     pKa_base       = float(config.get('pKa_base', 8.0))

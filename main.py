@@ -727,6 +727,7 @@ def main():
             args.equil_duration, args.duration,
             static, trained_params, final_scores,
             save_path=summary_path,
+            config=config,
         )
 
         print(f'\nSummary plot → {summary_path}')

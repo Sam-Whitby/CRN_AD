@@ -358,7 +358,8 @@ def plot_summary(loss_history, score_history, param_history,
                  equil_duration, duration_per_seg,
                  static, trained_params,
                  final_scores,
-                 save_path='summary.png'):
+                 save_path='summary.png',
+                 config=None):
     """
     Summary figure.
 
@@ -414,10 +415,12 @@ def plot_summary(loss_history, score_history, param_history,
     ax_conc = fig.add_subplot(gs[1, 0:2])
     ax_dG   = fig.add_subplot(gs[1, 2])
     if has_entropy:
-        ax_ent = fig.add_subplot(gs[2, 0:2])
-        ax_bar = fig.add_subplot(gs[3, 0:3])
+        ax_ent    = fig.add_subplot(gs[2, 0:2])
+        ax_params = fig.add_subplot(gs[2, 2])
+        ax_bar    = fig.add_subplot(gs[3, 0:3])
     else:
-        ax_bar = fig.add_subplot(gs[2, 0:3])
+        ax_params = fig.add_subplot(gs[2, 2])
+        ax_bar    = fig.add_subplot(gs[2, 0:2])
 
     ls_cycle = ['-', '--', '-.', ':', (0, (3, 1, 1, 1))]
 
@@ -429,6 +432,18 @@ def plot_summary(loss_history, score_history, param_history,
     ax_loss.set_ylabel('Loss  (−log p_target)', fontsize=10)
     ax_loss.set_title('Training Loss', fontsize=12)
     ax_loss.grid(alpha=0.25)
+    # Annotate learning rate and seed on the loss panel
+    _lr   = (config or {}).get('learning_rate', None)
+    _seed = (config or {}).get('seed', None)
+    _loss_ann = []
+    if _lr   is not None: _loss_ann.append(f'lr = {_lr}')
+    if _seed is not None: _loss_ann.append(f'seed = {_seed}')
+    if _loss_ann:
+        ax_loss.text(0.98, 0.97, '  '.join(_loss_ann),
+                     transform=ax_loss.transAxes, fontsize=7.5,
+                     ha='right', va='top',
+                     bbox=dict(boxstyle='round,pad=0.25', facecolor='white',
+                               alpha=0.75, edgecolor='#cccccc'))
 
     # -------------------------------------------------------------------
     # Panel 2 — pKa evolution  (one curve per species, shared across types)
@@ -450,6 +465,8 @@ def plot_summary(loss_history, score_history, param_history,
     # -------------------------------------------------------------------
     # Panel 3 — φ and J evolution
     # -------------------------------------------------------------------
+    _fixed_J_plot  = static.get('fixed_J')
+    _fixed_phi_plot = static.get('fixed_phi')
     ax_phiJ.plot(epochs, phi_hist, color='#2980b9', linewidth=2, label='φ (steric)')
     ax_phiJ.set_ylim(0, 1.05)
     ax_phiJ.set_xlabel('Epoch', fontsize=11)
@@ -458,7 +475,15 @@ def plot_summary(loss_history, score_history, param_history,
     ax2 = ax_phiJ.twinx()
     j_lbl = 'mean J (kT)' if J is None else 'J (kT)'
     ax2.plot(epochs, J_hist, color='#c0392b', linewidth=2, label=j_lbl)
-    ax2.set_ylabel(f'J  (kT, cap {J_max:.1f})', color='#c0392b', fontsize=11)
+    if _fixed_J_plot is not None:
+        j_axis_lbl = f'J  (kT, fixed={_fixed_J_plot:.2g})'
+        j_lo = max(0.0, float(_fixed_J_plot) * 0.9 - 0.5)
+        j_hi = float(_fixed_J_plot) * 1.1 + 0.5
+        ax2.set_ylim(j_lo, j_hi)
+    else:
+        j_axis_lbl = f'J  (kT, cap {J_max:.1f})'
+        ax2.set_ylim(0, J_max * 1.08)
+    ax2.set_ylabel(j_axis_lbl, color='#c0392b', fontsize=11)
     ax2.tick_params(axis='y', labelcolor='#c0392b')
     ax_phiJ.set_title('φ and J evolution', fontsize=12)
     h1, l1 = ax_phiJ.get_legend_handles_labels()
@@ -697,6 +722,79 @@ def plot_summary(loss_history, score_history, param_history,
     if baseline_val is not None:
         legend_handles.append(mpatches.Patch(color='#95a5a6', label='pH 7 baseline'))
     ax_bar.legend(handles=legend_handles, fontsize=9)
+
+    # -------------------------------------------------------------------
+    # Parameter table panel (ax_params)
+    # -------------------------------------------------------------------
+    ax_params.axis('off')
+    cfg = config or {}
+    _fp  = static.get('fixed_phi')
+    _fJ  = static.get('fixed_J')
+    _fpK = static.get('fixed_pKa')   # list or None
+    _nb  = bool(static.get('no_baseline', False))
+
+    def _fv(val, fmt='.4g'):
+        return format(float(val), fmt) if val is not None else '—'
+
+    # Trained final values
+    _phi_val = float(trained_params['phi'])
+    _J_val   = float(np.mean(np.array(trained_params['J'])))
+    _pKa_np  = np.array(trained_params['pKa'])
+
+    lines = ['─' * 28,
+             ' Parameters',
+             '─' * 28,
+             '',
+             ' System',
+             f'   n_species   {n_species}',
+             f'   n_types     {T}',
+             f'   N           {n}',
+             f'   n_pairs     {n_species // 2 * T}',
+             '',
+             ' Schedule',
+             f'   target pH   {list(pH_schedule)}',
+             f'   equil dur   {static["equil_duration"]:.0f}',
+             f'   seg dur     {duration_per_seg:.0f}',
+             f'   n_segs      {len(pH_schedule)}',
+             '',
+             ' Training',
+             f'   epochs      {len(loss_history)}',
+             f'   lr          {cfg.get("learning_rate", "—")}',
+             f'   seed        {cfg.get("seed", "—")}',
+             f'   tau         {static.get("tau", 5.0):.1f}',
+             '',
+             ' Physics',
+             f'   beta        {static["beta"]:.2f}',
+             f'   k0          {static["k0"]:.3g}',
+             f'   J_max       {J_max:.2f}  kT',
+             f'   smooth_w    {float(static.get("smooth_width", 0.0)):.2f}',
+             '',
+             ' Parameters (final)',
+    ]
+    # pKa lines
+    for i in range(n_species):
+        role = 'base' if acid_base[i * T] == 1 else 'acid'
+        tag  = '  [fixed]' if _fpK is not None else ''
+        lines.append(f'   pKa {SPECIES_NAMES[i]} ({role})  {float(_pKa_np[i]):.4f}{tag}')
+    lines.append(f'   phi         {_phi_val:.4f}'
+                 + ('  [fixed]' if _fp is not None else ''))
+    lines.append(f'   J           {_J_val:.4f}  kT'
+                 + ('  [fixed]' if _fJ is not None else ''))
+    lines += [
+        '',
+        ' Flags',
+        f'   no_baseline {_nb}',
+        f'   pka_default {_fpK is not None}',
+        '─' * 28,
+    ]
+
+    ax_params.text(0.04, 0.98, '\n'.join(lines),
+                   transform=ax_params.transAxes,
+                   fontsize=7.2, va='top', ha='left',
+                   family='monospace',
+                   bbox=dict(boxstyle='round,pad=0.4',
+                             facecolor='#f8f9fa', alpha=0.92,
+                             edgecolor='#cccccc', linewidth=0.8))
 
     fig.suptitle('CRN_AD — Training Summary', fontsize=15, fontweight='bold')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
