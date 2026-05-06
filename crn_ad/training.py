@@ -71,20 +71,23 @@ _clip_grad_norm.defvjp(_cgn_fwd, _cgn_bwd)
 # Parameter constraints
 # ---------------------------------------------------------------------------
 
-def constrain_params(raw, J_max=3.5, S_max=0.0, fixed_phi=None):
+def constrain_params(raw, J_max=3.5, S_max=0.0, fixed_phi=None,
+                     fixed_J=None, fixed_pKa=None):
     """
     Map unconstrained (ℝ) raw parameters to physical ranges.
 
-    pKa            ∈ [3, 10]       via 3 + 7·σ(raw)
-    phi            ∈ [0, 1]        via σ(raw)  (or fixed_phi if not None)
-    J              ∈ [0.5, J_max]  via 0.5 + (J_max−0.5)·σ(raw)
+    pKa            ∈ [3, 10]       via 3 + 7·σ(raw)  (or fixed_pKa if not None)
+    phi            ∈ [0, 1]        via σ(raw)          (or fixed_phi if not None)
+    J              ∈ [0.5, J_max]  via 0.5 + (J_max−0.5)·σ(raw)  (or fixed_J if not None)
     monomer_entropy∈ [0, S_max]    via S_max·σ(raw)   (scalar or n-vector)
     """
     out = {
-        'pKa': 3.0 + 7.0 * jax.nn.sigmoid(raw['pKa']),
+        'pKa': (jnp.array(fixed_pKa, dtype=float) if fixed_pKa is not None
+                else 3.0 + 7.0 * jax.nn.sigmoid(raw['pKa'])),
         'phi': (jnp.array(float(fixed_phi)) if fixed_phi is not None
                 else jax.nn.sigmoid(raw['phi'])),
-        'J':   0.5 + (J_max - 0.5) * jax.nn.sigmoid(raw['J']),
+        'J':   (jnp.array(float(fixed_J)) if fixed_J is not None
+                else 0.5 + (J_max - 0.5) * jax.nn.sigmoid(raw['J'])),
     }
     if S_max > 0.0 and 'monomer_entropy' in raw:
         out['monomer_entropy'] = S_max * jax.nn.sigmoid(raw['monomer_entropy'])
@@ -179,7 +182,9 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     p = constrain_params(raw_params,
                          J_max=static['J_max'],
                          S_max=static.get('S_max', 0.0),
-                         fixed_phi=static.get('fixed_phi'))
+                         fixed_phi=static.get('fixed_phi'),
+                         fixed_J=static.get('fixed_J'),
+                         fixed_pKa=static.get('fixed_pKa'))
     mono_s       = _get_monomer_entropy(p)
     sw              = float(static.get('smooth_width', 0.0))
     T               = static.get('T', 1)
@@ -238,14 +243,24 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
             final = _clip_grad_norm(float(grad_clip), final)
         return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
-    scores = jax.vmap(score_one)(all_pH_schedules_array)
-    tau    = static.get('tau', 5.0)
+    scores     = jax.vmap(score_one)(all_pH_schedules_array)
+    tau        = static.get('tau', 5.0)
+    no_baseline = bool(static.get('no_baseline', False))
 
-    # Append baseline as the last entry.  all_scores shape: (n_schedules + 1,)
-    # target_idx still indexes into the first n_schedules entries unchanged.
+    if no_baseline:
+        if scores.shape[0] == 1:
+            # Single schedule, nothing to discriminate: maximise score directly.
+            loss = 1.0 - scores[0]
+        else:
+            log_p = jax.nn.log_softmax(scores * tau)
+            loss  = -log_p[target_idx]
+    else:
+        log_p = jax.nn.log_softmax(jnp.append(scores, baseline_score) * tau)
+        loss  = -log_p[target_idx]
+
+    # Always return baseline as the final element so downstream indexing is consistent.
     all_scores = jnp.append(scores, baseline_score)
-    log_p      = jax.nn.log_softmax(all_scores * tau)
-    return -log_p[target_idx], all_scores
+    return loss, all_scores
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +384,15 @@ def train(config):
     fixed_phi_val  = config.get('fixed_phi', None)
     if fixed_phi_val is not None:
         fixed_phi_val = float(np.clip(fixed_phi_val, 0.0, 1.0))
+    fixed_J_val    = config.get('fixed_J', None)
+    if fixed_J_val is not None:
+        fixed_J_val = float(np.clip(fixed_J_val, 0.5, J_max))
+    pka_default    = bool(config.get('pka_default', False))
+    pKa_acid       = float(config.get('pKa_acid', 6.0))
+    pKa_base       = float(config.get('pKa_base', 8.0))
+    fixed_pKa_val  = (np.array([pKa_acid if i % 2 == 0 else pKa_base
+                                 for i in range(n_species)], dtype=float)
+                      if pka_default else None)
 
     # ------------------------------------------------------------------
     # Static quantities
@@ -430,6 +454,10 @@ def train(config):
         'no_self_bonds'      : no_self_bonds,
         'allowed_mask'       : allowed_mask_jax,
         'fixed_phi'          : fixed_phi_val,
+        'fixed_J'            : fixed_J_val,
+        'fixed_pKa'          : (fixed_pKa_val.tolist() if fixed_pKa_val is not None
+                                else None),
+        'no_baseline'        : bool(config.get('no_baseline', False)),
         'equil_ramp_duration': float(config.get('equil_duration', 80.0)) / 2.0,
         'grad_clip'          : (float(config['grad_clip'])
                                 if config.get('grad_clip') is not None else None),
@@ -457,6 +485,10 @@ def train(config):
             print(f"J_init       : {J_max}  kT  (--J_init_max)")
         if phi_init_max:
             print(f"phi_init     : 1.0  (--phi_init_max)")
+        if fixed_J_val is not None:
+            print(f"J (fixed)    : {fixed_J_val}  kT  (--fixed_J)")
+        if pka_default:
+            print(f"pKa (fixed)  : acid={pKa_acid}, base={pKa_base}  (--pka_default)")
         print(f"Smooth width : {smooth}  ({'enabled' if smooth > 0 else 'disabled'})")
         if S_max > 0:
             mode = f"per-species ({n_species} values)" if per_mono else "shared (1 value)"
@@ -566,7 +598,8 @@ def train(config):
     loss_history  = [float(lv)]
     score_history = [np.array(sc)]
 
-    p0 = constrain_params(raw_params, J_max=J_max, S_max=S_max, fixed_phi=fixed_phi_val)
+    p0 = constrain_params(raw_params, J_max=J_max, S_max=S_max, fixed_phi=fixed_phi_val,
+                          fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val)
     param_history = [_snapshot(p0, S_max)]
 
     nan_stopped = False
@@ -586,29 +619,36 @@ def train(config):
 
         loss_history.append(float(lv))
         score_history.append(np.array(sc))
-        p_cur = constrain_params(raw_params, J_max=J_max, S_max=S_max, fixed_phi=fixed_phi_val)
+        p_cur = constrain_params(raw_params, J_max=J_max, S_max=S_max,
+                                  fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
+                                  fixed_pKa=fixed_pKa_val)
         param_history.append(_snapshot(p_cur, S_max))
 
         if verbose and (epoch % max(1, n_epochs // 15) == 0 or epoch == n_epochs - 1):
-            pKa_str    = ' '.join(f'{float(v):.2f}' for v in p_cur['pKa'])
+            pKa_str    = (' '.join(f'{float(v):.2f}' for v in p_cur['pKa'])
+                          + (' (fixed)' if pka_default else ''))
             s_str      = ''
             if S_max > 0.0 and 'monomer_entropy' in p_cur:
                 s = p_cur['monomer_entropy']
                 s_str = f' | s̄={float(jnp.mean(s)):.3f} sₘₐₓ={float(jnp.max(s)):.3f}'
             phi_str    = (f'{fixed_phi_val:.3f} (fixed)' if fixed_phi_val is not None
                           else f'{float(p_cur["phi"]):.3f}')
-            n_scheds   = len(all_schedules)
-            sched_sc   = sc[:n_scheds]
-            mean_other = float(jnp.mean(jnp.delete(sched_sc, target_idx)))
-            baseline   = float(sc[n_scheds])
+            J_str      = (f'{fixed_J_val:.3f} (fixed)' if fixed_J_val is not None
+                          else f'{float(p_cur["J"]):.3f}')
+            n_scheds  = len(all_schedules)
+            sched_sc  = sc[:n_scheds]
+            baseline  = float(sc[n_scheds])
+            other_str = (f"mean_other={float(jnp.mean(jnp.delete(sched_sc, target_idx))):.3f} | "
+                         if n_scheds > 1 else "")
+            bl_tag    = '' if not static.get('no_baseline') else ' (not in loss)'
             print(
                 f"Epoch {epoch:4d}/{n_epochs} | "
                 f"loss={float(lv):.4f} | "
                 f"target={float(sc[target_idx]):.3f} | "
-                f"mean_other={mean_other:.3f} | "
-                f"baseline={baseline:.3f} | "
+                f"{other_str}"
+                f"baseline={baseline:.3f}{bl_tag} | "
                 f"pKa=[{pKa_str}] | φ={phi_str} | "
-                f"J={float(p_cur['J']):.3f}{s_str}",
+                f"J={J_str}{s_str}",
                 flush=True,
             )
 
@@ -618,7 +658,9 @@ def train(config):
         else:
             print("\nTraining complete.")
 
-    p_final  = constrain_params(raw_params, J_max=J_max, S_max=S_max, fixed_phi=fixed_phi_val)
+    p_final  = constrain_params(raw_params, J_max=J_max, S_max=S_max,
+                               fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
+                               fixed_pKa=fixed_pKa_val)
     mono_s   = _get_monomer_entropy(p_final)
     pKa_full = jnp.repeat(p_final['pKa'], T) if T > 1 else p_final['pKa']
     if mono_s is not None and per_mono and T > 1:

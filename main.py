@@ -115,6 +115,22 @@ def build_parser():
     p.add_argument('--fixed_phi', type=float, default=None,
                    help='If set, fix phi at this value in [0, 1] for the entire run '
                         'and do not train it.  If omitted, phi is a free parameter.')
+    p.add_argument('--fixed_J', type=float, default=None,
+                   help='If set, fix J (kT) at this value for the entire run '
+                        'and do not train it.  If omitted, J is a free parameter.')
+    p.add_argument('--pka_default', action='store_true',
+                   help='Fix pKa values and do not train them.  Acid-like species '
+                        '(even index) get pKa=--pKa_acid; base-like (odd) get pKa=--pKa_base.')
+    p.add_argument('--pKa_acid', type=float, default=6.0,
+                   help='pKa for acid-like species when --pka_default is set  [default: 6.0]')
+    p.add_argument('--pKa_base', type=float, default=8.0,
+                   help='pKa for base-like species when --pka_default is set  [default: 8.0]')
+    p.add_argument('--no_baseline', action='store_true',
+                   help='Exclude the pH-7 equilibrium baseline from the loss function. '
+                        'By default the baseline score is an additional negative class '
+                        'in the softmax loss.  With this flag only schedule permutations '
+                        'are compared.  For a single-pH target this makes the loss a '
+                        'direct maximisation of the correct-dimer fraction.')
     p.add_argument('--n_restarts', type=int, default=1,
                    help='Run training N times from different random starting points '
                         'and report the best result (lowest final loss).  Runs are '
@@ -191,10 +207,18 @@ def _run_one_restart(config_seed):
     result = _train(config)
     (raw_params, loss_history, score_history, param_history,
      *_, init_phys_np, nan_stopped) = result
+    _n_species = config.get('n_species', 2)
+    _pka_default = config.get('pka_default', False)
+    _pKa_acid = config.get('pKa_acid', 6.0)
+    _pKa_base = config.get('pKa_base', 8.0)
+    _fixed_pKa = ([_pKa_acid if i % 2 == 0 else _pKa_base for i in range(_n_species)]
+                  if _pka_default else None)
     p = _cp(raw_params,
             J_max=config.get('J_max', 3.5),
             S_max=config.get('S_max', 0.0),
-            fixed_phi=config.get('fixed_phi'))
+            fixed_phi=config.get('fixed_phi'),
+            fixed_J=config.get('fixed_J'),
+            fixed_pKa=_fixed_pKa)
     return {
         'seed'              : seed,
         'wide_init'         : wide_init,
@@ -348,7 +372,8 @@ def _j_scalar_for_history(J):
     return float(J_arr.mean()) if J_arr.ndim > 0 else float(J_arr)
 
 
-def _print_param_table(p_eval, static, fixed_phi=None, title='Parameters'):
+def _print_param_table(p_eval, static, fixed_phi=None, fixed_J=None,
+                       fixed_pKa=False, title='Parameters'):
     """Print a formatted parameter table to stdout."""
     n_species    = static.get('n_species', static['n'])
     T            = static.get('T', 1)
@@ -362,7 +387,8 @@ def _print_param_table(p_eval, static, fixed_phi=None, title='Parameters'):
     print('─' * W)
     print(f'  {title}')
     print('─' * W)
-    print(f'  {"Species":<12}  {"Role":<6}  {"pKa":>7}')
+    pKa_tag = '  (fixed)' if fixed_pKa else ''
+    print(f'  {"Species":<12}  {"Role":<6}  {"pKa":>7}{pKa_tag}')
     print(f'  {"─"*12}  {"─"*6}  {"─"*7}')
     for i in range(n_species):
         ab = 'base' if int(acid_base_np[i * T]) == 1 else 'acid'
@@ -373,8 +399,9 @@ def _print_param_table(p_eval, static, fixed_phi=None, title='Parameters'):
     print(f'  {"φ (steric factor)":<28} {phi:.4f}{phi_tag}')
 
     J_arr = np.array(J)
+    J_fixed_tag = '  kT  (fixed)' if fixed_J is not None else '  kT'
     if J_arr.ndim == 0:
-        print(f'  {"J (coupling)":<28} {float(J_arr):.4f}  kT')
+        print(f'  {"J (coupling)":<28} {float(J_arr):.4f}{J_fixed_tag}')
     else:
         print(f'  J (coupling, per pair):')
         for pair_idx in range(n_species // 2):
@@ -439,6 +466,11 @@ def main():
             j_init_max           = args.J_init_max,
             phi_init_max         = args.phi_init_max,
             fixed_phi            = args.fixed_phi,
+            fixed_J              = args.fixed_J,
+            pka_default          = args.pka_default,
+            pKa_acid             = args.pKa_acid,
+            pKa_base             = args.pKa_base,
+            no_baseline          = args.no_baseline,
             grad_clip            = args.grad_clip,
         )
 
@@ -502,8 +534,12 @@ def main():
             (raw_params, loss_history, score_history, param_history,
              static, all_schedules, target_idx, *_) = train(config)
 
+        _fixed_pKa_eval = ([args.pKa_acid if i % 2 == 0 else args.pKa_base
+                             for i in range(args.n_species)]
+                            if args.pka_default else None)
         p_eval = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max,
-                                  fixed_phi=args.fixed_phi)
+                                  fixed_phi=args.fixed_phi, fixed_J=args.fixed_J,
+                                  fixed_pKa=_fixed_pKa_eval)
         p_eval = {k: (np.array(v) if hasattr(v, '__len__') else float(v))
                   for k, v in p_eval.items()}
 
@@ -523,6 +559,8 @@ def main():
             'specific_bonds'     : args.specific_bonds,
             'no_self_bonds'      : args.no_self_bonds,
             'fixed_phi'          : args.fixed_phi,
+            'fixed_J'            : args.fixed_J,
+            'pka_default'        : args.pka_default,
         }
         if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
             params_out['monomer_entropy'] = np.atleast_1d(
@@ -534,6 +572,8 @@ def main():
 
         _print_param_table(p_eval, static,
                            fixed_phi=args.fixed_phi,
+                           fixed_J=args.fixed_J,
+                           fixed_pKa=args.pka_default,
                            title='Trained Parameters')
 
         target_sched = [float(x) for x in args.target_pH]
