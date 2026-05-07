@@ -372,14 +372,14 @@ def plot_summary(loss_history, score_history, param_history,
       before bar chart: entropy history (wide)
     """
     n               = static['n']
-    n_species       = static.get('n_species', n)
-    T               = static.get('T', 1)
+    n_species       = static.get('n_species', n)  # = 2*N_acids in M/N model
+    T               = static.get('T', 1)          # = 1 in M/N model
     plabels         = _particle_labels(n_species, T)
     i_idx, j_idx    = static['i_idx'], static['j_idx']
     correct_mask_np = static['correct_mask_np']
     acid_base       = np.array(static['acid_base'])
-    pKa             = np.array(trained_params['pKa'])          # shape (n_species,)
-    pKa_full        = np.repeat(pKa, T) if T > 1 else pKa      # shape (N,)
+    pKa             = np.array(trained_params['pKa'])  # shape (n_species,) = (2*N_acids,)
+    pKa_full        = pKa                               # one value per particle
     phi             = float(trained_params['phi'])
     J_raw           = trained_params['J']
     J_arr           = np.array(J_raw)
@@ -449,7 +449,7 @@ def plot_summary(loss_history, score_history, param_history,
     # Panel 2 — pKa evolution  (one curve per species, shared across types)
     # -------------------------------------------------------------------
     for i in range(n_species):
-        ab = 'base' if acid_base[i * T] == 1 else 'acid'
+        ab = 'base' if acid_base[i] == 1 else 'acid'
         ax_pka.plot(epochs, pKa_hist[:, i],
                     color=_species_color(i),
                     linestyle=ls_cycle[i % len(ls_cycle)],
@@ -566,10 +566,6 @@ def plot_summary(loss_history, score_history, param_history,
     _phi_eq  = float(trained_params['phi'])
     _J_eq    = trained_params['J']
     _me_eq   = trained_params.get('monomer_entropy', None)
-    # Expand per-species entropy to per-particle when T > 1
-    if (_me_eq is not None
-            and static.get('per_monomer_entropy', False) and T > 1):
-        _me_eq = np.repeat(np.atleast_1d(np.array(_me_eq)), T)
 
     ph_segs = [(7.0, 0.0, equil_duration)] + [
         (float(pH_schedule[si]),
@@ -637,9 +633,6 @@ def plot_summary(loss_history, score_history, param_history,
     pHs = np.linspace(2, 12, 300)
     mono_entropy = trained_params.get('monomer_entropy', None)
     mono_arr     = (np.array(mono_entropy) if mono_entropy is not None else None)
-    # Expand per-species entropy to per-particle for index lookup by ii/jj
-    if mono_arr is not None and len(mono_arr) > 1 and T > 1:
-        mono_arr = np.repeat(mono_arr, T)
 
     correct_count_dG = 0
     for k in range(n_triu):
@@ -741,15 +734,17 @@ def plot_summary(loss_history, score_history, param_history,
     _J_val   = float(np.mean(np.array(trained_params['J'])))
     _pKa_np  = np.array(trained_params['pKa'])
 
+    N_total = static.get('N_total', n_species // 2)
+    M_clf   = static.get('M_classifier', N_total)
     lines = ['─' * 28,
              ' Parameters',
              '─' * 28,
              '',
              ' System',
-             f'   n_species   {n_species}',
-             f'   n_types     {T}',
-             f'   N           {n}',
-             f'   n_pairs     {n_species // 2 * T}',
+             f'   N_acids     {N_total}',
+             f'   M_clf_pairs {M_clf}',
+             f'   N_roughness {N_total - M_clf}',
+             f'   n_particles {n}',
              '',
              ' Schedule',
              f'   target pH   {list(pH_schedule)}',
@@ -771,11 +766,11 @@ def plot_summary(loss_history, score_history, param_history,
              '',
              ' Parameters (final)',
     ]
-    # pKa lines
+    # pKa lines — n_species = 2*N_total in M/N model, T=1
     for i in range(n_species):
-        role = 'base' if acid_base[i * T] == 1 else 'acid'
+        role = 'base' if acid_base[i] == 1 else 'acid'
         tag  = '  [fixed]' if _fpK is not None else ''
-        lines.append(f'   pKa {SPECIES_NAMES[i]} ({role})  {float(_pKa_np[i]):.4f}{tag}')
+        lines.append(f'   pKa {SPECIES_NAMES[i % 26]} ({role})  {float(_pKa_np[i]):.4f}{tag}')
     lines.append(f'   phi         {_phi_val:.4f}'
                  + ('  [fixed]' if _fp is not None else ''))
     lines.append(f'   J           {_J_val:.4f}  kT'

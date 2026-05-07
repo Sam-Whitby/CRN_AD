@@ -14,13 +14,15 @@ The system models a well-mixed solution of charged monomers that dimerise revers
 
 ### Species and reactions
 
-The system contains `N = n_species × n_types` monomer particles. Particles are grouped into `n_species` species (A, B, C, …) each with `n_types` type copies (A1, A2, … AT). Every ordered pair can dimerise:
+The system contains `2N` monomer particles: `N` acid-like particles (indices 0…N−1) and `N` base-like particles (indices N…2N−1). Every ordered pair can dimerise:
 
 ```
-Xᵢ + Xⱼ  ⇌  Xᵢ·Xⱼ      for all 0 ≤ i ≤ j ≤ N−1
+Xᵢ + Xⱼ  ⇌  Xᵢ·Xⱼ      for all 0 ≤ i ≤ j ≤ 2N−1
 ```
 
-**Correct bonds** are same-species, matching-type pairs: (A1–B1), (A2–B2), (C1–D1), … Even-indexed species (A, C, …) are acid-like; odd-indexed (B, D, …) are base-like. Correct pairs carry opposite charges and attract electrostatically.
+The `M ≤ N` **classifier pairs** are acid *i* ↔ base *N+i* for *i* = 0…M−1. The remaining `N−M` acid/base particles (indices M…N−1 and N+M…2N−1) are **roughness species** — they have no correct bond and participate only in wrong-bond interactions, introducing energetic disorder into the landscape. All `2N` pKa values are independent trained parameters.
+
+Setting `M = N` recovers a pure-classifier model (no roughness). Setting `M < N` creates the disordered rugged landscape: the spread of pKa values across roughness species generates a Gaussian distribution of wrong-bond energies, giving the system kinetic memory of the sequence history.
 
 ### Henderson–Hasselbalch charges
 
@@ -36,14 +38,13 @@ q_k = −1 / (1 + 10^(pKa_k − pH))    (base-like, charge → +1 at low pH)
 ### Interaction free energies
 
 ```
-ΔGᵢⱼ = J · qᵢ · qⱼ          correct acid–base pair (same type)
-ΔGᵢⱼ = φ · J · qᵢ · qⱼ     all other acid–base pairs
+ΔGᵢⱼ = J · qᵢ · qⱼ          correct classifier pair (acid i ↔ base N+i, i < M)
+ΔGᵢⱼ = φ · J · qᵢ · qⱼ     all other acid–base pairs (wrong bonds)
 ΔGᵢⱼ = 0                    same-sign pairs (acid–acid, base–base)
-ΔGᵢⱼ = 0                    forbidden pairs (with --specific_bonds)
 ΔGᵢⱼ = 0                    identical particles (with --no_self_bonds)
 ```
 
-`J > 0` is the electrostatic coupling strength (kT); `φ ∈ [0, 1]` is the steric mismatch factor. `φ = 0` means wrong-type bonds are completely suppressed; `φ = 1` means correct and wrong-type bonds are energetically identical (no type selectivity). Maximising schedule selectivity therefore generally requires `φ < 1`.
+`J > 0` is the electrostatic coupling strength (kT); `φ ∈ [0, 1]` is the steric mismatch factor applied uniformly to all wrong bonds. `φ = 0` suppresses all wrong bonds; `φ = 1` makes all bonds energetically equivalent. Discrimination requires `φ < 1`, but the roughness species also need their pKa values spread away from the target pH steps to open the kinetic gate for the correct sequence.
 
 ### Kinetics (detailed balance)
 
@@ -115,23 +116,23 @@ Requires: `jax[cpu]`, `diffrax`, `optax`, `numpy`, `matplotlib`. Use `jax[cuda]`
 
 ```bash
 python main.py
-# Default: 4 species, target schedule [9, 5, 7], 300 epochs, outdir=outputs/
+# Default: N=4, M=2 → 4 acids + 4 bases, 2 classifier pairs + 2 roughness pairs
+# Target schedule [9, 5, 7], 300 epochs, outdir=outputs/
 ```
 
-### Custom species and schedule
+### Custom N, M, and schedule
 
 ```bash
 python main.py \
-  --n_species 6 --target_pH 9 5 7 \
+  --N 6 --M 3 --target_pH 9 5 7 \
   --duration 40 --equil_duration 100 --n_epochs 500 \
-  --lr 0.03 --outdir results/6species
-```
+  --lr 0.03 --outdir results/N6M3
 
-### Types: multiple particles per species
+# Pure classifier (no roughness): M = N
+python main.py --N 4 --M 4 --target_pH 9 5 7
 
-```bash
-# 2 species × 5 types = 10 particles; correct bonds are Aᵢ–Bᵢ for matching type
-python main.py --n_species 2 --n_types 5 --target_pH 5 9 7 --J_max 10
+# Many roughness species for strong kinetic memory
+python main.py --N 8 --M 2 --target_pH 9 5 7
 ```
 
 ### Fix parameters during training
@@ -202,9 +203,6 @@ python main.py --S_max 2.0 --per_monomer_entropy
 ### Bond topology flags
 
 ```bash
-# Only correct-species pairs interact (A can only bind B, not C or D)
-python main.py --specific_bonds
-
 # Identical particles have ΔG=0 (A–A, B–B, etc.)
 python main.py --no_self_bonds
 ```
@@ -212,9 +210,11 @@ python main.py --no_self_bonds
 ### Evaluate fixed parameters without training
 
 ```bash
+# N=2, M=1: 4 particles total (2 acids + 2 bases), 1 classifier pair + 1 roughness pair
+# --eval_pKa must supply 2*N = 4 values: [acid0, acid1, base0, base1]
 python main.py --mode eval \
-  --n_species 4 --target_pH 9 5 7 \
-  --eval_pKa 6.5 7.8 5.9 8.2 \
+  --N 2 --M 1 --target_pH 9 5 7 \
+  --eval_pKa 7.5 5.0 9.5 7.0 \
   --eval_phi 0.15 \
   --eval_J 3.5
 ```
@@ -242,8 +242,8 @@ python main.py --mode both --outdir outputs/
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--mode` | `train` | `train` · `animate` · `both` · `eval` |
-| `--n_species` | `4` | Number of species (even, ≥ 2). Species are A, B, C, … in pairs (A–B correct, C–D correct, …). |
-| `--n_types` | `1` | Type copies per species T. Particle count N = n\_species × T. Correct bonds are Aᵢ–Bᵢ for matching type index. |
+| `--N` | `4` | Number of acid species (= number of base species). Total particle count = 2N. |
+| `--M` | `2` | Number of classifier pairs (M ≤ N). Acid *i* ↔ base *N+i* for *i* = 0…M−1. Remaining N−M acid/base pairs are roughness-only species. |
 | `--target_pH` | `9.0 5.0 7.0` | Target pH schedule (one float per segment). The model is trained to fold only under this exact sequence. |
 | `--duration` | `30.0` | Duration of each pH segment (units of 1/k₀). Only the product k₀×duration matters — see note on k₀. |
 | `--equil_duration` | `80.0` | Duration of pH-7 pre-equilibration. Should satisfy equil\_duration ≫ exp(J) to reach thermodynamic equilibrium (e.g. J=3.5 → ≫33; J=10 → ≫22,000). |
@@ -262,8 +262,7 @@ python main.py --mode both --outdir outputs/
 | `--beta` | `1.0` | Inverse temperature β. When J is a free parameter, β is degenerate with J (only β·J enters the rates). Setting β=1 means J is measured in kT. |
 | `--J_max` | `3.5` | Upper bound on the coupling J (kT). Larger values allow stronger binding but increase ODE stiffness; use with `--smooth_width`. |
 | `--smooth_width` | `0.0` | Logistic sigmoid width (time units) for smoothing pH transitions. `0` = step function. Recommended 1–3 for `J_max > 5`. |
-| `--specific_bonds` | off | If set, only correct-species pairs interact. A cannot bind C, D, or another A; φ still controls type-mismatch selectivity within a correct species pair. |
-| `--no_self_bonds` | off | If set, identical particles have ΔG=0 (A1–A1, B2–B2, etc.). Cross-type interactions (A1–A2) are unaffected. |
+| `--no_self_bonds` | off | If set, identical particles have ΔG=0 (A–A, a–a, etc.). |
 
 ### Fixing parameters
 
@@ -271,16 +270,16 @@ python main.py --mode both --outdir outputs/
 |----------|---------|-------------|
 | `--fixed_phi VALUE` | off | Fix φ at this value for the entire run; do not train it. |
 | `--fixed_J VALUE` | off | Fix J (kT) at this value; do not train it. Not capped by `--J_max`. |
-| `--pka_default` | off | Fix all pKa values and do not train them. Acid-like species get `--pKa_acid`; base-like get `--pKa_base`. |
-| `--pKa_acid` | `6.0` | pKa for acid-like species when `--pka_default` is set. |
-| `--pKa_base` | `8.0` | pKa for base-like species when `--pka_default` is set. |
+| `--pka_default` | off | Fix all pKa values and do not train them. All N acids get `--pKa_acid`; all N bases get `--pKa_base`. |
+| `--pKa_acid` | `6.0` | pKa for all acid species when `--pka_default` is set. |
+| `--pKa_base` | `8.0` | pKa for all base species when `--pka_default` is set. |
 
 ### Conformational entropy
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--S_max` | `0.0` | Enable monomer conformational entropy. Each particle contributes `sᵢ ∈ [0, S_max]` kT to ΔGᵢⱼ = ΔGᵢⱼ + sᵢ + sⱼ. `0` = disabled. |
-| `--per_monomer_entropy` | off | If set, train a separate sᵢ per species (n\_species values). Default: one shared value. |
+| `--per_monomer_entropy` | off | If set, train a separate sᵢ per particle (2N values). Default: one shared value. |
 
 ### Optimiser and loss
 
@@ -311,10 +310,10 @@ python main.py --mode both --outdir outputs/
 
 | Argument | Description |
 |----------|-------------|
-| `--eval_pKa` | pKa values, one per species (required for `--mode eval`). |
+| `--eval_pKa` | pKa values, one per particle — must supply exactly 2×N values (required for `--mode eval`). |
 | `--eval_phi` | Steric mismatch factor φ ∈ [0, 1] (required). |
-| `--eval_J` | Coupling J (kT). One value → same for all pairs; n\_species/2 values → one per correct pair. |
-| `--eval_monomer_entropy` | Monomer entropy (kT). One value → shared; n\_species values → per-species. |
+| `--eval_J` | Coupling J (kT). One value → same for all pairs; M values → one per classifier pair. |
+| `--eval_monomer_entropy` | Monomer entropy (kT). One value → shared; 2N values → per-particle. |
 
 ---
 
@@ -342,23 +341,14 @@ python main.py --mode both --outdir outputs/
 `boltzmann_scan.py` scans thermodynamic equilibrium properties over a Cartesian grid of parameters without solving any ODEs. It uses a damped mean-field fixed-point iteration to compute the Boltzmann equilibrium directly.
 
 ```bash
-# Default sweep: phi × J × n_species × n_types × pH
+# Default sweep: phi × J × N × M × pH
 python boltzmann_scan.py
-
-# Custom grid
-python boltzmann_scan.py \
-  --phi 0.0 0.1 0.3 0.5 1.0 \
-  --J 1.0 2.0 3.0 5.0 \
-  --n_species 2 4 6 \
-  --n_types 1 2 3 \
-  --pH 5.0 7.0 9.0 \
-  --outfile my_sweep.csv
 
 # Fixed acid/base pKa (default 6.0 and 8.0)
 python boltzmann_scan.py --pKa_acid 5.5 --pKa_base 8.5 --beta 1.0
 ```
 
-Output columns include `phi`, `J`, `n_species`, `n_types`, `pH`, `correct_fraction` (fraction of monomer content in correct dimers at equilibrium), and `selectivity` (fraction of all dimers that are correct). The companion notebook `boltzmann_notebook.ipynb` visualises these results.
+Note: `boltzmann_scan.py` uses the legacy `n_species`/`n_types` parameterisation and has not yet been updated to the M/N model. The companion notebook `boltzmann_notebook.ipynb` visualises these results.
 
 ---
 

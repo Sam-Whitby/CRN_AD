@@ -6,20 +6,20 @@ Default behaviour
 -----------------
   python main.py
 
-  Trains a 4-species CRN to fold correctly only under the target schedule
-  [9, 5, 7], evaluates all 6 permutations, and saves a single summary PNG
-  which is then opened automatically.  No animation by default (--animate).
+  Trains a CRN with N=4 acid + 4 base species (M=2 classifier pairs,
+  2 roughness pairs) to fold correctly only under the target schedule
+  [9, 5, 7], evaluates all permutations, and saves a summary PNG.
 
 Usage examples
 --------------
-  python main.py                              # default 4-species run
-  python main.py --n_species 6 --n_epochs 400
+  python main.py                              # default N=4, M=2
+  python main.py --N 6 --M 3 --n_epochs 400
+  python main.py --N 8 --M 2                 # 2 classifier + 6 roughness pairs
   python main.py --target_pH 9 5 7
   python main.py --animate                    # also produce animated GIFs
   python main.py --mode animate               # load saved params + make plots
-  python main.py --J_max 5.0 --smooth_width 2.0    # larger J, smooth pH ramps
+  python main.py --J_max 5.0 --smooth_width 2.0
   python main.py --S_max 2.0                 # monomer entropy (shared value)
-  python main.py --S_max 2.0 --per_monomer_entropy  # per-monomer entropy
 """
 
 import argparse
@@ -56,12 +56,13 @@ def build_parser():
                    help='train: train and plot | animate: load saved params and plot | '
                         'eval: plot for fully-specified parameters given on the CLI | '
                         'both: train + animate')
-    p.add_argument('--n_species', type=int, default=4,
-                   help='Number of species types (even). E.g. 4 → A,B,C,D.')
-    p.add_argument('--n_types', type=int, default=1,
-                   help='Number of types per species (T). With T>1 species X '
-                        'becomes X1…XT. Correct bonds are Ai-Bi for matching type. '
-                        'All types of a species share the same pKa.')
+    p.add_argument('--N', type=int, default=4,
+                   help='Total number of acid species (and base species). '
+                        '2N monomers in total.')
+    p.add_argument('--M', type=int, default=2,
+                   help='Number of classifier pairs (M ≤ N). '
+                        'Acids 0..M-1 form correct bonds with bases N..N+M-1. '
+                        'Acids M..N-1 and bases N+M..2N-1 are roughness-only species.')
     p.add_argument('--target_pH', nargs='+', type=float, default=[9.0, 5.0, 7.0],
                    help='Target pH schedule, one value per segment.')
     p.add_argument('--duration', type=float, default=30.0,
@@ -230,11 +231,11 @@ def _run_one_restart(config_seed):
     result = _train(config)
     (raw_params, loss_history, score_history, param_history,
      *_, init_phys_np, nan_stopped) = result
-    _n_species = config.get('n_species', 2)
+    _N_acids = int(config.get('N_total', 2))
     _pka_default = config.get('pka_default', False)
     _pKa_acid = config.get('pKa_acid', 6.0)
     _pKa_base = config.get('pKa_base', 8.0)
-    _fixed_pKa = ([_pKa_acid if i % 2 == 0 else _pKa_base for i in range(_n_species)]
+    _fixed_pKa = ([_pKa_acid]*_N_acids + [_pKa_base]*_N_acids
                   if _pka_default else None)
     p = _cp(raw_params,
             J_max=config.get('J_max', 3.5),
@@ -258,42 +259,29 @@ def _run_one_restart(config_seed):
     }
 
 
-def _static_dict(n_species, T, beta, k0, n_points_sim, n_points_equil,
+def _static_dict(N_acids, M, beta, k0, n_points_sim, n_points_equil,
                  equil_duration, tau, J_max, S_max, smooth_width,
-                 per_monomer_entropy=False, specific_bonds=False,
                  no_self_bonds=False):
-    N = n_species * T
-    acid_base_np    = np.array([(k // T) % 2 for k in range(N)], dtype=int)
+    N = 2 * N_acids  # total particle count
+    acid_base_np    = np.array([0]*N_acids + [1]*N_acids, dtype=int)
     correct_mask_np = np.zeros((N, N), dtype=bool)
-    for pair_idx in range(n_species // 2):
-        for t in range(T):
-            i = 2 * pair_idx * T + t
-            j = (2 * pair_idx + 1) * T + t
-            correct_mask_np[i, j] = True
-            correct_mask_np[j, i] = True
-    species_pair_mask_np = np.zeros((N, N), dtype=bool)
-    for pair_idx in range(n_species // 2):
-        for t1 in range(T):
-            for t2 in range(T):
-                i = 2 * pair_idx * T + t1
-                j = (2 * pair_idx + 1) * T + t2
-                species_pair_mask_np[i, j] = True
-                species_pair_mask_np[j, i] = True
+    for i in range(M):
+        correct_mask_np[i, N_acids + i] = True
+        correct_mask_np[N_acids + i, i] = True
     i_idx, j_idx = make_triu_indices(N)
     correct_triu_idx = np.array([
         pos for pos, (ii, jj) in enumerate(zip(i_idx, j_idx))
         if correct_mask_np[ii, jj]
     ])
-    allowed_mask_jax = jnp.array(species_pair_mask_np) if specific_bonds else None
     return {
         'n'                   : N,
-        'n_species'           : n_species,
-        'T'                   : T,
+        'n_species'           : N,  # for visualize.py compat: 2*N_acids pKa values
+        'N_total'             : N_acids,
+        'M_classifier'        : M,
         'acid_base'           : jnp.array(acid_base_np),
         'acid_base_np'        : acid_base_np,
         'correct_mask'        : jnp.array(correct_mask_np),
         'correct_mask_np'     : correct_mask_np,
-        'species_pair_mask_np': species_pair_mask_np,
         'i_idx'               : i_idx,
         'j_idx'               : j_idx,
         'correct_triu_idx'    : jnp.array(correct_triu_idx),
@@ -309,26 +297,20 @@ def _static_dict(n_species, T, beta, k0, n_points_sim, n_points_equil,
         'J_max'               : float(J_max),
         'S_max'               : float(S_max),
         'smooth_width'        : float(smooth_width),
-        'per_monomer_entropy' : bool(per_monomer_entropy),
-        'specific_bonds'      : bool(specific_bonds),
         'no_self_bonds'       : bool(no_self_bonds),
-        'allowed_mask'        : allowed_mask_jax,
+        'allowed_mask'        : None,
     }
 
 
 def get_equil_and_schedule_traj(p, static, target_sched, duration):
     """Run pH-7 equilibration then target schedule; return trajectories."""
     n            = static['n']
-    T            = static.get('T', 1)
     allowed_mask  = static.get('allowed_mask', None)
     no_self_bonds = bool(static.get('no_self_bonds', False))
     mono_s        = _get_mono(p, static)
 
-    # Expand species-level pKa (n_species,) → particle-level (N,)
-    pKa_arr  = jnp.array(p['pKa'])
-    pKa_full = jnp.repeat(pKa_arr, T) if T > 1 else pKa_arr
-    if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
-        mono_s = jnp.repeat(mono_s, T)
+    # pKa already has one value per particle (2*N_acids elements)
+    pKa_full = jnp.array(p['pKa'])
 
     equil_ramp = float(static.get('equil_ramp_duration', 0.0))
     equil_final, equil_traj = simulate_schedule(
@@ -370,24 +352,19 @@ def _get_mono(p, static):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_J_matrix(J_pairs, n_species, T):
-    """Build an N×N J matrix for eval mode with per-correct-pair coupling.
+def _build_J_matrix(J_pairs, N_acids, M):
+    """Build a 2N×2N J matrix for eval mode with per-classifier-pair coupling.
 
-    Correct pair p uses J_pairs[p].  All other interactions (wrong species,
-    homodimers) use the mean of J_pairs as a baseline before phi is applied.
+    Classifier pair i uses J_pairs[i].  All other interactions use the mean
+    of J_pairs as a baseline (before phi is applied to wrong bonds).
     """
-    N = n_species * T
-    n_pairs = n_species // 2
+    N = 2 * N_acids
     J_mean = float(np.mean(J_pairs))
     J_mat = np.full((N, N), J_mean, dtype=float)
-    for pair_idx in range(n_pairs):
-        J_p = float(J_pairs[pair_idx])
-        for t1 in range(T):
-            for t2 in range(T):
-                i = 2 * pair_idx * T + t1
-                j = (2 * pair_idx + 1) * T + t2
-                J_mat[i, j] = J_p
-                J_mat[j, i] = J_p
+    for i in range(M):
+        J_p = float(J_pairs[i])
+        J_mat[i, N_acids + i] = J_p
+        J_mat[N_acids + i, i] = J_p
     return jnp.array(J_mat)
 
 
@@ -400,8 +377,8 @@ def _j_scalar_for_history(J):
 def _print_param_table(p_eval, static, fixed_phi=None, fixed_J=None,
                        fixed_pKa=False, title='Parameters'):
     """Print a formatted parameter table to stdout."""
-    n_species    = static.get('n_species', static['n'])
-    T            = static.get('T', 1)
+    N_acids      = static.get('N_total', static['n'] // 2)
+    M_clf        = static.get('M_classifier', N_acids)
     acid_base_np = np.array(static['acid_base_np'])
     pKa          = np.array(p_eval['pKa'])
     phi          = float(p_eval['phi'])
@@ -411,13 +388,20 @@ def _print_param_table(p_eval, static, fixed_phi=None, fixed_J=None,
 
     print('─' * W)
     print(f'  {title}')
+    print(f'  N={N_acids} acids + {N_acids} bases  |  M={M_clf} classifier pairs  |  '
+          f'{N_acids-M_clf} roughness acid/base pairs')
     print('─' * W)
     pKa_tag = '  (fixed)' if fixed_pKa else ''
-    print(f'  {"Species":<12}  {"Role":<6}  {"pKa":>7}{pKa_tag}')
-    print(f'  {"─"*12}  {"─"*6}  {"─"*7}')
-    for i in range(n_species):
-        ab = 'base' if int(acid_base_np[i * T]) == 1 else 'acid'
-        print(f'  {SPECIES_NAMES[i]:<12}  {ab:<6}  {float(pKa[i]):>7.4f}')
+    print(f'  {"Particle":<14}  {"Role":<10}  {"Type":<12}  {"pKa":>7}{pKa_tag}')
+    print(f'  {"─"*14}  {"─"*10}  {"─"*12}  {"─"*7}')
+    for i in range(N_acids):
+        role = 'classifier' if i < M_clf else 'roughness'
+        print(f'  {SPECIES_NAMES[i]:<14}  {"acid":<10}  {role:<12}  {float(pKa[i]):>7.4f}')
+    for i in range(N_acids):
+        j = N_acids + i
+        role = 'classifier' if i < M_clf else 'roughness'
+        label = SPECIES_NAMES[i].lower() if i < 26 else f'b{i}'
+        print(f'  {label:<14}  {"base":<10}  {role:<12}  {float(pKa[j]):>7.4f}')
 
     phi_tag = '  (fixed)' if fixed_phi is not None else ''
     print()
@@ -428,14 +412,10 @@ def _print_param_table(p_eval, static, fixed_phi=None, fixed_J=None,
     if J_arr.ndim == 0:
         print(f'  {"J (coupling)":<28} {float(J_arr):.4f}{J_fixed_tag}')
     else:
-        print(f'  J (coupling, per pair):')
-        for pair_idx in range(n_species // 2):
-            A   = SPECIES_NAMES[2 * pair_idx]
-            B   = SPECIES_NAMES[2 * pair_idx + 1]
-            i0  = 2 * pair_idx * T
-            j0  = (2 * pair_idx + 1) * T
-            j_v = float(J_arr[i0, j0])
-            print(f'    {A}–{B}: {j_v:.4f}  kT')
+        print(f'  J (coupling, per classifier pair):')
+        for i in range(M_clf):
+            j_v = float(J_arr[i, N_acids + i])
+            print(f'    {SPECIES_NAMES[i]}–{SPECIES_NAMES[i].lower()}: {j_v:.4f}  kT')
 
     if S_max > 0.0 and p_eval.get('monomer_entropy') is not None:
         s = np.atleast_1d(np.array(p_eval['monomer_entropy']))
@@ -471,8 +451,8 @@ def main():
         # Internally we always use k0=1 so that times are in natural units (1/k0).
         _k0 = float(args.k0)
         config = dict(
-            n_species            = args.n_species,
-            n_types              = args.n_types,
+            N_total              = args.N,
+            M_classifier         = args.M,
             target_pH_schedule   = args.target_pH,
             duration_per_seg     = args.duration * _k0,
             equil_duration       = args.equil_duration * _k0,
@@ -488,7 +468,6 @@ def main():
             smooth_width         = args.smooth_width,
             S_max                = args.S_max,
             per_monomer_entropy  = args.per_monomer_entropy,
-            specific_bonds       = args.specific_bonds,
             no_self_bonds        = args.no_self_bonds,
             wide_init            = args.wide_init,
             j_init_max           = args.J_init_max,
@@ -528,7 +507,7 @@ def main():
             # Print summary table
             n_epochs_req = int(config['n_epochs'])
             S_max_cfg    = float(config.get('S_max', 0.0))
-            print(f'  {"seed":>5}  {"init":>8}  {"start pKa":<{12 * config["n_species"] // 2}}  '
+            print(f'  {"seed":>5}  {"init":>8}  {"start pKa (2N values)":<30}  '
                   f'{"φ":>5}  {"J":>5}'
                   + (f'  {"s̄":>5}' if S_max_cfg > 0 else '')
                   + f'  {"epochs":>11}  {"loss":>8}')
@@ -563,8 +542,7 @@ def main():
             (raw_params, loss_history, score_history, param_history,
              static, all_schedules, target_idx, *_) = train(config)
 
-        _fixed_pKa_eval = ([args.pKa_acid if i % 2 == 0 else args.pKa_base
-                             for i in range(args.n_species)]
+        _fixed_pKa_eval = ([args.pKa_acid]*args.N + [args.pKa_base]*args.N
                             if args.pka_default else None)
         p_eval = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max,
                                   fixed_phi=args.fixed_phi, fixed_J=args.fixed_J,
@@ -574,8 +552,8 @@ def main():
 
         # Save params
         params_out = {
-            'n_species'         : args.n_species,
-            'n_types'           : args.n_types,
+            'N_total'           : args.N,
+            'M_classifier'      : args.M,
             'target_pH_schedule': args.target_pH,
             'pKa'               : p_eval['pKa'].tolist(),
             'phi'               : float(p_eval['phi']),
@@ -587,7 +565,6 @@ def main():
             'J_max'             : args.J_max,
             'S_max'             : args.S_max,
             'per_monomer_entropy': args.per_monomer_entropy,
-            'specific_bonds'     : args.specific_bonds,
             'no_self_bonds'      : args.no_self_bonds,
             'fixed_phi'          : args.fixed_phi,
             'fixed_J'            : args.fixed_J,
@@ -620,23 +597,21 @@ def main():
             pdata = json.load(f)
         _J_max  = float(pdata.get('J_max', args.J_max))
         _S_max  = float(pdata.get('S_max', args.S_max))
-        _permon = bool(pdata.get('per_monomer_entropy', False))
-        _T      = int(pdata.get('n_types', 1))
-        _specb  = bool(pdata.get('specific_bonds', False))
-        _nsb = bool(pdata.get('no_self_bonds', False))
+        _nsb    = bool(pdata.get('no_self_bonds', False))
+        _N_anim = int(pdata['N_total'])
+        _M_anim = int(pdata['M_classifier'])
         # Load effective durations (k0-multiplied) from params file if present.
-        # Old params files store raw k0; derive effective duration from those.
         _k0_anim = float(pdata.get('k0', 1.0))
         _anim_equil_dur = float(pdata.get('equil_duration',
                                           args.equil_duration * _k0_anim))
         _anim_duration  = float(pdata.get('duration_per_seg',
                                           args.duration * _k0_anim))
         static = _static_dict(
-            pdata['n_species'], _T,
+            _N_anim, _M_anim,
             pdata['beta'], 1.0,
             args.n_points_sim, args.n_points_equil,
             _anim_equil_dur, args.tau,
-            _J_max, _S_max, args.smooth_width, _permon, _specb, _nsb,
+            _J_max, _S_max, args.smooth_width, _nsb,
         )
         p_eval = {
             'pKa': np.array(pdata['pKa']),
@@ -662,41 +637,35 @@ def main():
         if missing:
             print(f'ERROR: --mode eval requires {", ".join(missing)}')
             sys.exit(1)
-        if len(args.eval_pKa) != args.n_species:
-            print(f'ERROR: --eval_pKa must have exactly {args.n_species} values '
-                  f'(got {len(args.eval_pKa)}) — set --n_species accordingly.')
+        if len(args.eval_pKa) != 2 * args.N:
+            print(f'ERROR: --eval_pKa must have exactly {2*args.N} values '
+                  f'(got {len(args.eval_pKa)}) — set --N accordingly.')
             sys.exit(1)
 
-        n_pairs = args.n_species // 2
+        n_pairs = args.M
         j_raw   = args.eval_J
         if len(j_raw) == 1:
             J_eval = float(j_raw[0])          # scalar: same J for all pairs
         elif len(j_raw) == n_pairs:
-            J_eval = _build_J_matrix(j_raw, args.n_species, args.n_types)
+            J_eval = _build_J_matrix(j_raw, args.N, args.M)
         else:
             print(f'ERROR: --eval_J must have 1 value (same for all pairs) or '
-                  f'{n_pairs} values (one per correct pair). Got {len(j_raw)}.')
+                  f'{n_pairs} values (one per classifier pair). Got {len(j_raw)}.')
             sys.exit(1)
 
         # --- Monomer entropy for eval mode ---
-        # If --eval_monomer_entropy is given, use those values.
-        # If omitted but --S_max > 0, default to S_max as the shared value.
-        # Validate count: must be 1 (shared) or n_species (per-species).
         me_raw = args.eval_monomer_entropy
         if me_raw is not None:
             if len(me_raw) == 1:
-                mono_eval = np.array(me_raw, dtype=float)        # shape (1,) → shared
-            elif len(me_raw) == args.n_species:
-                mono_eval = np.array(me_raw, dtype=float)        # shape (n_species,)
+                mono_eval = np.array(me_raw, dtype=float)        # shared
+            elif len(me_raw) == 2 * args.N:
+                mono_eval = np.array(me_raw, dtype=float)        # per-particle
             else:
                 print(f'ERROR: --eval_monomer_entropy must have 1 value (shared) or '
-                      f'{args.n_species} values (one per species). Got {len(me_raw)}.')
+                      f'{2*args.N} values (one per particle). Got {len(me_raw)}.')
                 sys.exit(1)
-            # S_max must cover the given entropy so _get_mono doesn't silently drop it.
-            # If user forgot --S_max, infer it from the given values.
             S_max_eval = max(args.S_max, float(np.max(mono_eval)))
         elif args.S_max > 0.0:
-            # --S_max given, no explicit entropy → use S_max as the shared entropy value
             mono_eval  = np.array([args.S_max], dtype=float)
             S_max_eval = args.S_max
         else:
@@ -704,12 +673,12 @@ def main():
             S_max_eval = 0.0
 
         static = _static_dict(
-            args.n_species, args.n_types,
+            args.N, args.M,
             args.beta, args.k0,
             args.n_points_sim, args.n_points_equil,
             args.equil_duration, args.tau,
             args.J_max, S_max_eval, args.smooth_width,
-            args.per_monomer_entropy, args.specific_bonds, args.no_self_bonds,
+            args.no_self_bonds,
         )
         p_eval = {
             'pKa'            : np.array(args.eval_pKa),
@@ -799,12 +768,9 @@ def main():
     if args.animate or args.mode == 'both':
         print('\nGenerating animations ...')
         n               = static['n']
-        T_val           = static.get('T', 1)
         acid_base_np    = static['acid_base_np']
         correct_mask_np = static['correct_mask_np']
-        # pKa for animation: expand from n_species to N particles
-        pKa_vis = np.array(p_eval['pKa'])
-        pKa_vis = np.repeat(pKa_vis, T_val) if T_val > 1 else pKa_vis
+        pKa_vis = np.array(p_eval['pKa'])  # already one value per particle
 
         for s_idx, sched in enumerate(
                 [all_schedules[target_idx]] +

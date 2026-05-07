@@ -187,16 +187,12 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                          fixed_pKa=static.get('fixed_pKa'))
     mono_s       = _get_monomer_entropy(p)
     sw              = float(static.get('smooth_width', 0.0))
-    T               = static.get('T', 1)
     allowed_mask    = static.get('allowed_mask', None)
     no_self_bonds   = bool(static.get('no_self_bonds', False))
     equil_ramp      = float(static.get('equil_ramp_duration', 0.0))
     grad_clip    = static.get('grad_clip', None)
-    # Expand species-level pKa (n_species,) → particle-level (N,)
-    pKa_full = jnp.repeat(p['pKa'], T) if T > 1 else p['pKa']
-    # Expand per-species entropy (n_species,) → (N,) when T > 1
-    if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
-        mono_s = jnp.repeat(mono_s, T)
+    # pKa array already has one value per particle (2*N_acids elements)
+    pKa_full = p['pKa']
 
     # Score is computed from the FINAL state after the full schedule —
     # equil gives the starting state, then each permutation is run to completion.
@@ -282,17 +278,13 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     initial_state = make_initial_state(static['n'])
     sw            = float(static.get('smooth_width', 0.0))
 
-    T             = static.get('T', 1)
     allowed_mask  = static.get('allowed_mask', None)
     no_self_bonds = bool(static.get('no_self_bonds', False))
-    pKa          = jnp.array(p_constrained['pKa'])
-    pKa          = jnp.repeat(pKa, T) if T > 1 else pKa
+    pKa          = jnp.array(p_constrained['pKa'])  # already 2*N_acids values
     phi          = jnp.array(p_constrained['phi'])
     J            = jnp.array(p_constrained['J'])
     mono_s = (_get_monomer_entropy(p_constrained)
               if p_constrained.get('monomer_entropy') is not None else None)
-    if mono_s is not None and static.get('per_monomer_entropy', False) and T > 1:
-        mono_s = jnp.repeat(mono_s, T)
 
     equil_ramp = float(static.get('equil_ramp_duration', 0.0))
 
@@ -348,7 +340,8 @@ def train(config):
 
     config keys
     -----------
-    n_species          : int (even, ≤ 10)
+    N_total            : int  (number of acid species = number of base species)
+    M_classifier       : int  (≤ N_total, number of correct acid-base pairs)
     target_pH_schedule : list[float]
     duration_per_seg   : float
     equil_duration     : float   (default 80)
@@ -365,17 +358,15 @@ def train(config):
     seed               : int
     (NaN: training stops at the last finite epoch; report is always generated)
     """
-    n_species = config['n_species']
-    assert n_species % 2 == 0 and n_species >= 2
-    T = int(config.get('n_types', 1))
-    assert T >= 1
-    N = n_species * T  # total particle count
+    N_acids = int(config['N_total'])
+    M = int(config['M_classifier'])
+    assert N_acids >= 1 and M >= 1 and M <= N_acids
+    N = 2 * N_acids  # total particle count (N acids + N bases)
 
     J_max          = float(config.get('J_max', 3.5))
     S_max          = float(config.get('S_max', 0.0))
     smooth         = float(config.get('smooth_width', 0.0))
     per_mono       = bool(config.get('per_monomer_entropy', False))
-    specific_bonds = bool(config.get('specific_bonds', False))
     no_self_bonds  = bool(config.get('no_self_bonds', False))
     wide_init      = bool(config.get('wide_init', False))
     j_init_max     = bool(config.get('j_init_max', False))
@@ -390,35 +381,21 @@ def train(config):
     pka_default    = bool(config.get('pka_default', False))
     pKa_acid       = float(config.get('pKa_acid', 6.0))
     pKa_base       = float(config.get('pKa_base', 8.0))
-    fixed_pKa_val  = (np.array([pKa_acid if i % 2 == 0 else pKa_base
-                                 for i in range(n_species)], dtype=float)
+    fixed_pKa_val  = (np.array([pKa_acid]*N_acids + [pKa_base]*N_acids, dtype=float)
                       if pka_default else None)
 
     # ------------------------------------------------------------------
     # Static quantities
     # ------------------------------------------------------------------
-    # Particle k: species s = k // T, type t = k % T
-    # acid if s is even, base if s is odd
-    acid_base_np    = np.array([(k // T) % 2 for k in range(N)], dtype=int)
-    # Correct bond: same species pair (A-B, C-D, ...) AND same type index
+    # Particles 0..N_acids-1 are acids; N_acids..2*N_acids-1 are bases.
+    # Correct bonds: acid i ↔ base N_acids+i, for i in 0..M-1 (classifier pairs).
+    # Particles M..N_acids-1 (acids) and N_acids+M..2*N_acids-1 (bases) are
+    # roughness species — they participate in wrong bonds only.
+    acid_base_np    = np.array([0]*N_acids + [1]*N_acids, dtype=int)
     correct_mask_np = np.zeros((N, N), dtype=bool)
-    for pair_idx in range(n_species // 2):
-        for t in range(T):
-            i = 2 * pair_idx * T + t
-            j = (2 * pair_idx + 1) * T + t
-            correct_mask_np[i, j] = True
-            correct_mask_np[j, i] = True
-
-    # Species-pair mask: correct species pair, any type (superset of correct_mask)
-    # Used with --specific_bonds to zero out cross-species and homodimer interactions
-    species_pair_mask_np = np.zeros((N, N), dtype=bool)
-    for pair_idx in range(n_species // 2):
-        for t1 in range(T):
-            for t2 in range(T):
-                i = 2 * pair_idx * T + t1
-                j = (2 * pair_idx + 1) * T + t2
-                species_pair_mask_np[i, j] = True
-                species_pair_mask_np[j, i] = True
+    for i in range(M):
+        correct_mask_np[i, N_acids + i] = True
+        correct_mask_np[N_acids + i, i] = True
 
     i_idx, j_idx = make_triu_indices(N)
     correct_triu_idx = np.array([
@@ -426,17 +403,17 @@ def train(config):
         if correct_mask_np[ii, jj]
     ])
 
-    allowed_mask_jax = jnp.array(species_pair_mask_np) if specific_bonds else None
+    allowed_mask_jax = None  # specific_bonds not applicable in M/N model
 
     static = {
         'n'                  : N,
-        'n_species'          : n_species,
-        'T'                  : T,
+        'n_species'          : N,  # kept for visualize.py compat: 2*N_acids pKa values
+        'N_total'            : N_acids,
+        'M_classifier'       : M,
         'acid_base'          : jnp.array(acid_base_np),
         'acid_base_np'       : acid_base_np,
         'correct_mask'       : jnp.array(correct_mask_np),
         'correct_mask_np'    : correct_mask_np,
-        'species_pair_mask_np': species_pair_mask_np,
         'i_idx'              : i_idx,
         'j_idx'              : j_idx,
         'correct_triu_idx'   : jnp.array(correct_triu_idx),
@@ -457,9 +434,8 @@ def train(config):
         'S_max'              : S_max,
         'smooth_width'       : smooth,
         'per_monomer_entropy': per_mono,
-        'specific_bonds'     : specific_bonds,
         'no_self_bonds'      : no_self_bonds,
-        'allowed_mask'       : allowed_mask_jax,
+        'allowed_mask'       : None,
         'fixed_phi'          : fixed_phi_val,
         'fixed_J'            : fixed_J_val,
         'fixed_pKa'          : (fixed_pKa_val.tolist() if fixed_pKa_val is not None
@@ -479,11 +455,12 @@ def train(config):
     duration      = float(config['duration_per_seg'])
     all_pH_array  = jnp.array(all_schedules, dtype=float)
 
-    # entropy trained per species (shared across types of same species)
-    n_entropy = n_species if per_mono else 1
-    type_str  = f" × {T} types = {N} particles" if T > 1 else ""
+    # entropy: per-particle if per_mono, else shared
+    n_entropy = N if per_mono else 1
     if verbose:
-        print(f"Species      : {n_species}  ({n_species//2} correct pairs){type_str}")
+        print(f"N_acids      : {N_acids}  ({M} classifier, {N_acids-M} roughness)")
+        print(f"N_bases      : {N_acids}  ({M} classifier, {N_acids-M} roughness)")
+        print(f"Particles    : {N}  ({N_acids} acids + {N_acids} bases)")
         print(f"Target sched : {target_sched}")
         print(f"Permutations : {len(all_schedules)}  (target idx = {target_idx})")
         print(f"Equilibration: pH 7,  t = {static['equil_duration']} (β=1)")
@@ -498,29 +475,32 @@ def train(config):
             print(f"pKa (fixed)  : acid={pKa_acid}, base={pKa_base}  (--pka_default)")
         print(f"Smooth width : {smooth}  ({'enabled' if smooth > 0 else 'disabled'})")
         if S_max > 0:
-            mode = f"per-species ({n_species} values)" if per_mono else "shared (1 value)"
+            mode = f"per-particle ({N} values)" if per_mono else "shared (1 value)"
             print(f"Entropy      : S_max = {S_max} kT, {mode}")
 
     # ------------------------------------------------------------------
     # Initial parameters  (pKa: one per species, shared across types)
     # ------------------------------------------------------------------
     rng = np.random.default_rng(int(config.get('seed', 42)))
+    L = len(target_sched)
 
     if wide_init:
-        # Wide uniform sampling across the full valid range — used for
-        # multi-restart training to avoid converging to the same local minimum.
-        pKa_init = list(rng.uniform(3.1, 9.9, n_species))
+        # Wide uniform sampling — 2*N_acids values, one per particle.
+        pKa_init = list(rng.uniform(3.1, 9.9, N))
         phi_init = float(rng.uniform(0.05, 0.95))
         J_init   = float(rng.uniform(0.55, J_max - 0.01))
     else:
-        pH_min, pH_max = float(min(target_sched)), float(max(target_sched))
-        pKa_init = []
-        for i in range(n_species):
-            if i % 2 == 0:  # acid species
-                centre = np.clip(pH_min + 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
-            else:            # base species
-                centre = np.clip(pH_max - 1.5 + rng.normal(0.0, 0.5), 3.1, 9.9)
-            pKa_init.append(float(centre))
+        # Classifier acids (0..M-1): pKa below the corresponding target pH step.
+        pKa_clf_acid = [float(np.clip(target_sched[k % L] - 1.5 + rng.normal(0.0, 0.5),
+                                      3.1, 9.9)) for k in range(M)]
+        # Roughness acids (M..N_acids-1): uniformly spread across full range.
+        pKa_rgh_acid = list(rng.uniform(3.1, 9.9, N_acids - M))
+        # Classifier bases (N_acids..N_acids+M-1): pKa above the corresponding target pH step.
+        pKa_clf_base = [float(np.clip(target_sched[k % L] + 1.5 + rng.normal(0.0, 0.5),
+                                      3.1, 9.9)) for k in range(M)]
+        # Roughness bases (N_acids+M..2*N_acids-1): uniformly spread.
+        pKa_rgh_base = list(rng.uniform(3.1, 9.9, N_acids - M))
+        pKa_init = pKa_clf_acid + pKa_rgh_acid + pKa_clf_base + pKa_rgh_base
         phi_init = float(np.clip(0.2 + rng.normal(0.0, 0.05), 0.01, 0.99))
         J_init   = float(np.clip(1.5 + rng.normal(0.0, 0.2),  0.51, J_max - 0.01))
 
@@ -646,7 +626,10 @@ def train(config):
         param_history.append(_snapshot(p_cur, S_max))
 
         if verbose and (epoch % max(1, n_epochs // 15) == 0 or epoch == n_epochs - 1):
-            pKa_str    = (' '.join(f'{float(v):.2f}' for v in p_cur['pKa'])
+            pKa_arr    = [float(v) for v in p_cur['pKa']]
+            acid_str   = ' '.join(f'{v:.2f}' for v in pKa_arr[:N_acids])
+            base_str   = ' '.join(f'{v:.2f}' for v in pKa_arr[N_acids:])
+            pKa_str    = (f'acids:[{acid_str}] bases:[{base_str}]'
                           + (' (fixed)' if pka_default else ''))
             s_str      = ''
             if S_max > 0.0 and 'monomer_entropy' in p_cur:
@@ -683,9 +666,7 @@ def train(config):
                                fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
                                fixed_pKa=fixed_pKa_val)
     mono_s   = _get_monomer_entropy(p_final)
-    pKa_full = jnp.repeat(p_final['pKa'], T) if T > 1 else p_final['pKa']
-    if mono_s is not None and per_mono and T > 1:
-        mono_s = jnp.repeat(mono_s, T)
+    pKa_full = p_final['pKa']  # already 2*N_acids values, one per particle
     equil_state = simulate_schedule_scan(
         initial_state, jnp.array([7.0]), static['equil_duration'],
         pKa_full, static['acid_base'], p_final['phi'], p_final['J'],
