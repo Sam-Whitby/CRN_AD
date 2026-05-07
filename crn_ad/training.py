@@ -442,8 +442,15 @@ def train(config):
         'correct_triu_idx'   : jnp.array(correct_triu_idx),
         'beta'               : float(config.get('beta', 1.0)),
         'k0'                 : float(config.get('k0',  1.0)),
-        'n_points_sim'       : int(config.get('n_points_sim',   40)),
-        'n_points_equil'     : int(config.get('n_points_equil', 60)),
+        # n_points controls how many trajectory points are saved for visualisation.
+        # They do not affect ODE accuracy (governed by rtol/atol).
+        # Default: ~2 saved points per unit dimensionless time (k0·duration).
+        'n_points_sim'       : (int(config['n_points_sim'])
+                                if config.get('n_points_sim') is not None
+                                else max(20, int(2 * float(config['duration_per_seg'])))),
+        'n_points_equil'     : (int(config['n_points_equil'])
+                                if config.get('n_points_equil') is not None
+                                else max(30, int(2 * float(config.get('equil_duration', 80.0))))),
         'equil_duration'     : float(config.get('equil_duration', 80.0)),
         'tau'                : float(config.get('tau', 5.0)),
         'J_max'              : J_max,
@@ -482,9 +489,9 @@ def train(config):
         print(f"Equilibration: pH 7,  t = {static['equil_duration']} (β=1)")
         print(f"J_max        : {J_max}  kT")
         if j_init_max:
-            print(f"J_init       : {J_max}  kT  (--J_init_max)")
+            print(f"J_init       : {J_max * 0.9:.3g}  kT  (--J_init_max, 90% of J_max)")
         if phi_init_max:
-            print(f"phi_init     : 1.0  (--phi_init_max)")
+            print(f"phi_init     : 0.9  (--phi_init_max, near but not at boundary)")
         if fixed_J_val is not None:
             print(f"J (fixed)    : {fixed_J_val}  kT  (--fixed_J)")
         if pka_default:
@@ -518,9 +525,13 @@ def train(config):
         J_init   = float(np.clip(1.5 + rng.normal(0.0, 0.2),  0.51, J_max - 0.01))
 
     if j_init_max:
-        J_init = J_max   # unconstrain_params clips J_norm to 1-1e-4 if J_init == J_max
+        # Do NOT initialise at exactly J_max: J_norm=1 → raw_J≈9.2 → σ'≈1e-4 (vanishing).
+        # Also, phi=1 is a physical degeneracy point (all bond types equivalent → zero gradient).
+        # 0.9×J_max gives raw_J≈2.2 → σ'≈0.09, 900× larger gradient while still "near max".
+        J_init = J_max * 0.9
     if phi_init_max:
-        phi_init = 1.0   # unconstrain_params clips phi_norm to 1-1e-4
+        # Same reasoning: phi=1 → physical degeneracy AND sigmoid vanishing.
+        phi_init = 0.9
 
     init_phys = {
         'pKa': jnp.array(pKa_init),
@@ -551,13 +562,23 @@ def train(config):
     # ------------------------------------------------------------------
     # Optimiser  (lr passed as traced JAX array — no recompile on change)
     # ------------------------------------------------------------------
-    clip_norm = float(config.get('clip_norm', 0.5))
-    lr        = float(config.get('learning_rate', 0.02))
+    clip_norm    = float(config.get('clip_norm', 0.5))
+    lr           = float(config.get('learning_rate', 0.02))
+    weight_decay = float(config.get('weight_decay', 0.0))
 
-    _opt_core = optax.chain(
-        optax.clip_by_global_norm(clip_norm),
-        optax.scale_by_adam(),
-    )
+    if weight_decay > 0.0:
+        # AdamW: L2 penalty on raw params pulls them toward 0 (sigmoid midpoint),
+        # preventing any parameter from drifting to and sticking at a boundary.
+        _opt_core = optax.chain(
+            optax.clip_by_global_norm(clip_norm),
+            optax.scale_by_adam(),
+            optax.add_decayed_weights(weight_decay),
+        )
+    else:
+        _opt_core = optax.chain(
+            optax.clip_by_global_norm(clip_norm),
+            optax.scale_by_adam(),
+        )
     opt_state = _opt_core.init(raw_params)
 
     # ------------------------------------------------------------------

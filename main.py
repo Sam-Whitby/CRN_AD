@@ -65,18 +65,35 @@ def build_parser():
     p.add_argument('--target_pH', nargs='+', type=float, default=[9.0, 5.0, 7.0],
                    help='Target pH schedule, one value per segment.')
     p.add_argument('--duration', type=float, default=30.0,
-                   help='Duration of each pH segment (time units).')
+                   help='Duration of each pH segment in units of 1/k0.  '
+                        'Together with --k0 only the product k0×duration matters '
+                        '(rescaling k0 and duration by the same factor is exactly equivalent).')
     p.add_argument('--equil_duration', type=float, default=80.0,
-                   help='Duration of pH-7 pre-equilibration (time units).')
+                   help='Duration of pH-7 pre-equilibration in units of 1/k0.  '
+                        'Should satisfy k0×equil_duration ≫ exp(J) to reach '
+                        'thermodynamic equilibrium (e.g. J=3.5→≫33, J=10→≫22000).')
     p.add_argument('--n_epochs', type=int, default=300)
     p.add_argument('--lr', type=float, default=0.02, help='Adam learning rate.')
-    p.add_argument('--beta', type=float, default=1.0, help='Inverse temperature β.')
-    p.add_argument('--k0', type=float, default=1.0, help='Base rate constant k₀.')
-    p.add_argument('--tau', type=float, default=6.0, help='Softmax loss temperature.')
-    p.add_argument('--n_points_sim', type=int, default=40,
-                   help='ODE time points per schedule segment.')
-    p.add_argument('--n_points_equil', type=int, default=60,
-                   help='ODE time points for pH-7 equilibration.')
+    p.add_argument('--beta', type=float, default=1.0,
+                   help='Inverse temperature β.  When J is trained, β is degenerate '
+                        'with J (only β·J matters); changing β is equivalent to '
+                        'rescaling J. Meaningful as a true temperature knob only when '
+                        'J is fixed via --fixed_J.  Default 1.0 (energies in kT).')
+    p.add_argument('--k0', type=float, default=1.0,
+                   help='Base rate constant k₀.  Only the products k0×duration and '
+                        'k0×equil_duration matter physically; --k0 is a convenience '
+                        'multiplier that is absorbed into the durations internally.  '
+                        'Small k0 → kinetic trapping; large k0 → thermodynamic limit.')
+    p.add_argument('--tau', type=float, default=6.0,
+                   help='Softmax temperature τ in the training loss.  '
+                        'Higher τ sharpens discrimination between schedules.  '
+                        'Does not affect ODE physics.')
+    p.add_argument('--n_points_sim', type=int, default=None,
+                   help='ODE output points per schedule segment (visualisation only, '
+                        'does not affect ODE accuracy).  Default: auto = max(20, 2×duration).')
+    p.add_argument('--n_points_equil', type=int, default=None,
+                   help='ODE output points for equilibration (visualisation only).  '
+                        'Default: auto = max(30, 2×equil_duration).')
     p.add_argument('--outdir', type=str, default='outputs')
     p.add_argument('--params_file', type=str, default='trained_params.json')
     p.add_argument('--animate', action='store_true',
@@ -150,6 +167,12 @@ def build_parser():
                    help='If set, initialise φ at 1.0 (maximum steric mismatch penalty) '
                         'rather than the default ~0.2. Overrides both standard and '
                         '--wide_init φ sampling.')
+    # ---- Optimiser options ----
+    p.add_argument('--weight_decay', type=float, default=0.0,
+                   help='AdamW L2 weight decay on raw (unconstrained) parameters.  '
+                        'Provides a restoring force pulling raw params toward 0 '
+                        '(the sigmoid midpoint), preventing boundary sticking.  '
+                        'Try 1e-4 to 1e-2.  Default 0 (plain Adam).')
     # ---- Gradient clipping (JAX custom_vjp approach) ----
     p.add_argument('--grad_clip', type=float, default=None,
                    help='If set, clip the L2 norm of gradients flowing back through each '
@@ -276,8 +299,10 @@ def _static_dict(n_species, T, beta, k0, n_points_sim, n_points_equil,
         'correct_triu_idx'    : jnp.array(correct_triu_idx),
         'beta'                : float(beta),
         'k0'                  : float(k0),
-        'n_points_sim'        : int(n_points_sim),
-        'n_points_equil'      : int(n_points_equil),
+        'n_points_sim'        : (int(n_points_sim) if n_points_sim is not None
+                                  else 40),
+        'n_points_equil'      : (int(n_points_equil) if n_points_equil is not None
+                                  else max(30, int(2 * float(equil_duration)))),
         'equil_duration'      : float(equil_duration),
         'equil_ramp_duration' : float(equil_duration) / 2.0,
         'tau'                 : float(tau),
@@ -442,18 +467,21 @@ def main():
     # TRAIN
     # =====================================================================
     if args.mode in ('train', 'both'):
+        # k0 is absorbed into the durations: only k0×duration matters physically.
+        # Internally we always use k0=1 so that times are in natural units (1/k0).
+        _k0 = float(args.k0)
         config = dict(
             n_species            = args.n_species,
             n_types              = args.n_types,
             target_pH_schedule   = args.target_pH,
-            duration_per_seg     = args.duration,
-            equil_duration       = args.equil_duration,
+            duration_per_seg     = args.duration * _k0,
+            equil_duration       = args.equil_duration * _k0,
             n_epochs             = args.n_epochs,
             learning_rate        = args.lr,
             beta                 = args.beta,
-            k0                   = args.k0,
-            n_points_sim         = args.n_points_sim,
-            n_points_equil       = args.n_points_equil,
+            k0                   = 1.0,
+            n_points_sim         = args.n_points_sim,    # None → auto in training.py
+            n_points_equil       = args.n_points_equil,  # None → auto in training.py
             tau                  = args.tau,
             seed                 = args.seed,
             J_max                = args.J_max,
@@ -471,6 +499,7 @@ def main():
             pKa_acid             = args.pKa_acid,
             pKa_base             = args.pKa_base,
             no_baseline          = args.no_baseline,
+            weight_decay         = args.weight_decay,
             grad_clip            = args.grad_clip,
         )
 
@@ -552,7 +581,9 @@ def main():
             'phi'               : float(p_eval['phi']),
             'J'                 : float(p_eval['J']),
             'beta'              : args.beta,
-            'k0'                : args.k0,
+            'k0'                : 1.0,
+            'duration_per_seg'  : float(config['duration_per_seg']),
+            'equil_duration'    : float(config['equil_duration']),
             'J_max'             : args.J_max,
             'S_max'             : args.S_max,
             'per_monomer_entropy': args.per_monomer_entropy,
@@ -593,11 +624,18 @@ def main():
         _T      = int(pdata.get('n_types', 1))
         _specb  = bool(pdata.get('specific_bonds', False))
         _nsb = bool(pdata.get('no_self_bonds', False))
+        # Load effective durations (k0-multiplied) from params file if present.
+        # Old params files store raw k0; derive effective duration from those.
+        _k0_anim = float(pdata.get('k0', 1.0))
+        _anim_equil_dur = float(pdata.get('equil_duration',
+                                          args.equil_duration * _k0_anim))
+        _anim_duration  = float(pdata.get('duration_per_seg',
+                                          args.duration * _k0_anim))
         static = _static_dict(
             pdata['n_species'], _T,
-            pdata['beta'], pdata['k0'],
+            pdata['beta'], 1.0,
             args.n_points_sim, args.n_points_equil,
-            args.equil_duration, args.tau,
+            _anim_equil_dur, args.tau,
             _J_max, _S_max, args.smooth_width, _permon, _specb, _nsb,
         )
         p_eval = {
@@ -699,14 +737,27 @@ def main():
     if args.mode in ('train', 'both', 'animate', 'eval'):
         print('\nGenerating summary plot ...')
 
+        # Effective duration to use for visualization trajectories.
+        # In train mode k0 was absorbed into the duration, so the static dict
+        # uses k0=1 and the effective duration is config['duration_per_seg'].
+        # In animate mode the effective duration was loaded from the params file.
+        # In eval mode k0 in the static dict handles the scaling, so args.duration
+        # is passed as-is (the ODE RHS multiplies by static['k0']).
+        if args.mode in ('train', 'both'):
+            _eff_duration = float(config['duration_per_seg'])
+        elif args.mode == 'animate':
+            _eff_duration = _anim_duration
+        else:  # eval
+            _eff_duration = args.duration
+
         equil_traj, schedule_trajs, _ = get_equil_and_schedule_traj(
-            p_eval, static, target_sched, args.duration)
+            p_eval, static, target_sched, _eff_duration)
 
         # Fast vmap-based scoring — compiles once, runs in parallel
         print('  Scoring all schedule permutations ...')
         all_schedules_local = all_schedules if args.mode == 'animate' else all_schedules
         final_scores = compute_scores_fast(
-            p_eval, all_schedules_local, args.duration, static)
+            p_eval, all_schedules_local, _eff_duration, static)
 
         if args.mode == 'animate' or score_history is None:
             score_history = [final_scores]
@@ -720,14 +771,15 @@ def main():
                                 if p_eval.get('monomer_entropy') is not None else None),
         }
 
+        _plot_config = config if args.mode in ('train', 'both') else None
         plot_summary(
             loss_history, score_history, param_history,
             all_schedules_local, target_idx,
             equil_traj, schedule_trajs, target_sched,
-            args.equil_duration, args.duration,
+            static['equil_duration'], _eff_duration,
             static, trained_params, final_scores,
             save_path=summary_path,
-            config=config,
+            config=_plot_config,
         )
 
         print(f'\nSummary plot → {summary_path}')
@@ -759,12 +811,12 @@ def main():
                 [s for i, s in enumerate(all_schedules) if i != target_idx][:2]):
             label = 'target' if s_idx == 0 else f'perm{s_idx}'
             equil_t, sched_trajs, _ = get_equil_and_schedule_traj(
-                p_eval, static, sched, args.duration)
+                p_eval, static, sched, _eff_duration)
             gif = os.path.join(outdir, f'animation_{label}.gif')
             try:
                 animate_crn(
                     [equil_t] + sched_trajs, n, acid_base_np, correct_mask_np,
-                    [7.0] + list(sched), args.duration,
+                    [7.0] + list(sched), _eff_duration,
                     pKa_visual=pKa_vis,
                     output_path=gif, fps=12,
                 )

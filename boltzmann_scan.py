@@ -178,7 +178,7 @@ def main():
                    default=list(np.round(np.linspace(0.0, 1.0, 21), 4)),
                    help='phi values  [default: 21 pts in [0, 1]]')
     p.add_argument('--J', type=float, nargs='+',
-                   default=list(np.round(np.linspace(0.5, 5.0, 20), 4)),
+                   default=list(np.round(np.linspace(0.1, 20.0, 20), 4)),
                    help='J values (kT)  [default: 20 pts in [0.5, 5.0]]')
     p.add_argument('--n_species', type=int, nargs='+',
                    default=[2, 4, 6, 8, 10],
