@@ -130,12 +130,20 @@ def _get_monomer_entropy(p):
 # ---------------------------------------------------------------------------
 
 def correct_bond_score(state, n, correct_triu_idx):
-    """Fraction of total monomer content in correct dimers."""
+    """Fraction of classifier pairs that have formed correct dimers.
+
+    Normalized so 1.0 means all M classifier pairs are fully dimerized,
+    regardless of how many roughness species are present (M/N ratio).
+    Each classifier acid/base particle starts at concentration total/(2N),
+    so the max achievable correct dimer sum is M * total/(2N).
+    """
     free    = state[:n]
     dimers  = state[n:]
     total   = jnp.sum(free) + 2.0 * jnp.sum(dimers)
     correct = jnp.sum(dimers[correct_triu_idx])
-    return 2.0 * correct / (total + 1e-10)
+    n_clf   = correct_triu_idx.shape[0]       # M, number of classifier pairs
+    max_possible = float(n_clf) / float(n) * total   # = M/(2N) * total
+    return correct / (max_possible + 1e-10)
 
 
 def total_monomer_content(state, n):

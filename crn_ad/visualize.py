@@ -536,15 +536,17 @@ def plot_summary(loss_history, score_history, param_history,
                       if correct_triu else np.zeros(len(t_all)))
     sum_incorrect  = (all_st[:, n:][:, incorrect_triu].sum(axis=1)
                       if incorrect_triu else np.zeros(len(t_all)))
-    # Maximum possible: all monomer content in correct dimers → M/2
-    max_correct = M_t / 2.0
+    # Maximum possible: all classifier-pair monomer in correct dimers → M/(2N)
+    M_clf   = static.get('M_classifier', n // 2)
+    N_acids = static.get('N_total', n // 2)
+    max_correct = M_t * M_clf / (2 * N_acids)
 
     ax_conc.plot(t_all, sum_correct,   color='#27ae60', linewidth=3.5,
                  label='Σ correct dimers', zorder=5)
     ax_conc.plot(t_all, sum_incorrect, color='#e74c3c', linewidth=3.5,
                  label='Σ incorrect dimers', zorder=5)
     ax_conc.plot(t_all, max_correct,   color='#aaaaaa', linewidth=2.5,
-                 linestyle='--', label='max possible correct (M/2)', zorder=4)
+                 linestyle='--', label=f'max possible correct (M={M_clf}/2N={2*N_acids})', zorder=4)
 
     # Segment shading
     seg_colors = ['#2980b9', '#27ae60', '#c0392b', '#8e44ad', '#d35400']
@@ -580,8 +582,8 @@ def plot_summary(loss_history, score_history, param_history,
             _phi_eq, _J_eq, _beta_eq, n, i_idx, j_idx,
             monomer_entropy=_me_eq, allowed_mask_np=_am_eq,
             no_self_bonds=_no_sb)
-        lbl_c = 'Σ correct (thermo. eq.)'   if not _eq_legend_done else None
-        lbl_i = 'Σ incorrect (thermo. eq.)' if not _eq_legend_done else None
+        lbl_c = 'Σ correct (eq. from dissoc.)'   if not _eq_legend_done else None
+        lbl_i = 'Σ incorrect (eq. from dissoc.)' if not _eq_legend_done else None
         _eq_legend_done = True
         x_mid = 0.5 * (ts0 + ts1)
         ax_conc.plot([ts0, ts1], [eq_c, eq_c], color='#27ae60',
