@@ -87,3 +87,74 @@ def rate_matrices(dG, beta, k0):
     kf = k0 * jnp.exp(-beta * jnp.maximum(dG, 0.0))
     kb = k0 * jnp.exp( beta * jnp.minimum(dG, 0.0))
     return kf, kb
+
+
+def boltzmann_equilibrium_jax(pKa, phi, J, pH, acid_base, correct_mask, beta, n,
+                               i_idx, j_idx, monomer_entropy=None, allowed_mask=None,
+                               no_self_bonds=False, n_iter=100):
+    """Differentiable Boltzmann equilibrium via unrolled Python loop.
+
+    Returns JAX array [free_monomers (n), dimers_triu (n*(n+1)//2)].
+
+    Unlike boltzmann_initial_state (numpy), this runs entirely in JAX so
+    reverse-mode gradients w.r.t. pKa/phi/J flow through correctly.
+    Uses a Python-level for loop: JAX unrolls it at trace time into a
+    differentiable sequence of operations (unlike lax.fori_loop/while_loop
+    which are NOT reverse-mode differentiable).
+
+    n_iter=100 converges to <1e-10 for all physically reasonable J values.
+    """
+    charges = henderson_hasselbalch(pKa, float(pH), acid_base)
+    dG = interaction_energy_matrix(charges, correct_mask, phi, J,
+                                   monomer_entropy=monomer_entropy,
+                                   allowed_mask=allowed_mask)
+    K = jnp.exp(-float(beta) * dG)
+    if no_self_bonds:
+        K = K * (1.0 - jnp.eye(n))
+    K_diag = jnp.diag(K)
+    C = jnp.ones(n) / float(n)
+    x = C
+    for _ in range(n_iter):
+        Fx = C / (1.0 + jnp.dot(K, x) + K_diag * x)
+        x = 0.5 * (x + Fx)
+    dimer_triu = K[i_idx, j_idx] * x[i_idx] * x[j_idx]
+    return jnp.concatenate([x, dimer_triu])
+
+
+def boltzmann_initial_state(pH, pKa_full_np, acid_base_np, correct_mask_np,
+                             phi, J, beta, n, i_idx, j_idx,
+                             monomer_entropy_np=None, allowed_mask_np=None,
+                             no_self_bonds=False, n_iter=3000, tol=1e-12):
+    """State vector at thermodynamic equilibrium via fixed-point iteration.
+
+    Returns numpy array [free_monomers (n), dimers_triu (n*(n+1)//2)].
+    Total monomer content = 1.  Same fixed-point algorithm as
+    _boltzmann_equilibrium in visualize.py but returns the full state
+    vector rather than dimer sums, for use as an ODE initial condition.
+    """
+    charges = np.array(henderson_hasselbalch(
+        jnp.array(pKa_full_np, dtype=float), float(pH),
+        jnp.array(acid_base_np, dtype=float)))
+    me_jax = jnp.array(monomer_entropy_np) if monomer_entropy_np is not None else None
+    am_jax = jnp.array(allowed_mask_np)    if allowed_mask_np  is not None else None
+    dG = np.array(interaction_energy_matrix(
+        jnp.array(charges),
+        jnp.array(correct_mask_np, dtype=bool),
+        float(phi),
+        jnp.array(J, dtype=float) if np.ndim(J) > 0 else float(J),
+        monomer_entropy=me_jax, allowed_mask=am_jax))
+    K = np.exp(-float(beta) * dG)
+    if no_self_bonds:
+        np.fill_diagonal(K, 0.0)
+    C = np.ones(n) / n
+    x = C.copy()
+    K_diag = np.diag(K).copy()
+    for _ in range(n_iter):
+        Fx = C / (1.0 + K.dot(x) + K_diag * x)
+        x_new = 0.5 * (x + Fx)
+        if np.max(np.abs(x_new - x)) < tol:
+            x = x_new
+            break
+        x = x_new
+    dimer_triu = K[i_idx, j_idx] * x[i_idx] * x[j_idx]
+    return np.concatenate([x, dimer_triu])

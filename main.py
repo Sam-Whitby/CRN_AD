@@ -40,7 +40,8 @@ from crn_ad.training  import (train, constrain_params, all_unique_permutations,
                                correct_bond_score, compute_scores_fast)
 from crn_ad.dynamics  import (simulate_schedule, make_initial_state, make_triu_indices)
 from crn_ad.visualize import (plot_summary, animate_crn,
-                               plot_final_concentrations, SPECIES_NAMES)
+                               plot_final_concentrations, SPECIES_NAMES,
+                               _mn_particle_labels)
 
 
 # ---------------------------------------------------------------------------
@@ -52,10 +53,12 @@ def build_parser():
         description='CRN_AD: pH-responsive Chemical Reaction Network trainer',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument('--mode', choices=['train', 'animate', 'both', 'eval'], default='train',
+    p.add_argument('--mode', choices=['train', 'animate', 'both', 'eval', 'csv'],
+                   default='train',
                    help='train: train and plot | animate: load saved params and plot | '
                         'eval: plot for fully-specified parameters given on the CLI | '
-                        'both: train + animate')
+                        'both: train + animate | '
+                        'csv: load trained_params.json and export all species time traces')
     p.add_argument('--N', type=int, default=4,
                    help='Total number of acid species (and base species). '
                         '2N monomers in total.')
@@ -72,7 +75,14 @@ def build_parser():
     p.add_argument('--equil_duration', type=float, default=80.0,
                    help='Duration of pH-7 pre-equilibration in units of 1/k0.  '
                         'Should satisfy k0×equil_duration ≫ exp(J) to reach '
-                        'thermodynamic equilibrium (e.g. J=3.5→≫33, J=10→≫22000).')
+                        'thermodynamic equilibrium (e.g. J=3.5→≫33, J=10→≫22000).  '
+                        'Ignored when --start_equil is set.')
+    p.add_argument('--start_equil', action='store_true',
+                   help='Start each simulation from the Boltzmann equilibrium state '
+                        'at pH 7 (computed from current trained parameters) rather than '
+                        'running a kinetic ODE equilibration.  Sets equil_duration to 0 '
+                        'for visualisation purposes.  Useful for studying discrimination '
+                        'from a pre-equilibrated initial condition.')
     p.add_argument('--n_epochs', type=int, default=300)
     p.add_argument('--lr', type=float, default=0.02, help='Adam learning rate.')
     p.add_argument('--beta', type=float, default=1.0,
@@ -304,6 +314,7 @@ def _static_dict(N_acids, M, beta, k0, n_points_sim, n_points_equil,
 
 def get_equil_and_schedule_traj(p, static, target_sched, duration):
     """Run pH-7 equilibration then target schedule; return trajectories."""
+    from crn_ad.physics import boltzmann_initial_state as _bis
     n            = static['n']
     allowed_mask  = static.get('allowed_mask', None)
     no_self_bonds = bool(static.get('no_self_bonds', False))
@@ -312,19 +323,39 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
     # pKa already has one value per particle (2*N_acids elements)
     pKa_full = jnp.array(p['pKa'])
 
-    equil_ramp = float(static.get('equil_ramp_duration', 0.0))
-    equil_final, equil_traj = simulate_schedule(
-        make_initial_state(n), [7.0], static['equil_duration'],
-        pKa_full, static['acid_base'],
-        jnp.array(p['phi']), jnp.array(p['J']),
-        static['beta'], static['k0'],
-        static['correct_mask'], n, static['i_idx'], static['j_idx'],
-        n_points=static['n_points_equil'],
-        monomer_entropy=mono_s,
-        allowed_mask=allowed_mask,
-        beta_ramp_duration=equil_ramp,
-        no_self_bonds=no_self_bonds,
-    )
+    if static.get('start_equil', False):
+        # Compute Boltzmann equilibrium at pH 7 — no ODE needed.
+        equil_final = jnp.array(_bis(
+            7.0,
+            np.array(p['pKa']),
+            static['acid_base_np'],
+            static['correct_mask_np'],
+            float(p['phi']),
+            p['J'],
+            static['beta'],
+            n,
+            static['i_idx'],
+            static['j_idx'],
+            monomer_entropy_np=(np.array(p['monomer_entropy'])
+                                if p.get('monomer_entropy') is not None else None),
+            no_self_bonds=no_self_bonds,
+        ))
+        equil_traj_data = np.array(equil_final)[np.newaxis, :]  # (1, state_size)
+    else:
+        equil_ramp = float(static.get('equil_ramp_duration', 0.0))
+        equil_final, equil_traj = simulate_schedule(
+            make_initial_state(n), [7.0], static['equil_duration'],
+            pKa_full, static['acid_base'],
+            jnp.array(p['phi']), jnp.array(p['J']),
+            static['beta'], static['k0'],
+            static['correct_mask'], n, static['i_idx'], static['j_idx'],
+            n_points=static['n_points_equil'],
+            monomer_entropy=mono_s,
+            allowed_mask=allowed_mask,
+            beta_ramp_duration=equil_ramp,
+            no_self_bonds=no_self_bonds,
+        )
+        equil_traj_data = np.array(equil_traj[0])
 
     final_state, schedule_trajs = simulate_schedule(
         equil_final, target_sched, duration,
@@ -337,7 +368,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
         allowed_mask=allowed_mask,
         no_self_bonds=no_self_bonds,
     )
-    return equil_traj[0], schedule_trajs, final_state
+    return equil_traj_data, schedule_trajs, final_state
 
 
 def _get_mono(p, static):
@@ -433,6 +464,145 @@ def _print_param_table(p_eval, static, fixed_phi=None, fixed_J=None,
 
 
 # ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+
+def export_csv(params_path, outdir, args):
+    """Simulate all schedule permutations and write a wide-format CSV.
+
+    Columns: schedule, is_target, time, segment, pH,
+             free_<label> (one per monomer),
+             dimer_<label>-<label> (one per triu dimer pair),
+             eq_<label>-<label> (Boltzmann equilibrium dimer, constant per segment).
+    """
+    from crn_ad.physics import boltzmann_initial_state as _bis
+
+    with open(params_path) as _f:
+        pdata = json.load(_f)
+
+    N_acids      = int(pdata['N_total'])
+    M            = int(pdata['M_classifier'])
+    N            = 2 * N_acids
+    _k0_csv      = float(pdata.get('k0', 1.0))
+    equil_dur    = float(pdata.get('equil_duration', args.equil_duration * _k0_csv))
+    seg_dur      = float(pdata.get('duration_per_seg', args.duration * _k0_csv))
+    beta_csv     = float(pdata.get('beta', 1.0))
+    J_max_csv    = float(pdata.get('J_max', args.J_max))
+    S_max_csv    = float(pdata.get('S_max', 0.0))
+    no_sb_csv    = bool(pdata.get('no_self_bonds', False))
+    start_e      = bool(pdata.get('start_equil', False))
+    if start_e:
+        equil_dur = 0.0
+
+    n_pts_sim  = args.n_points_sim or 40
+    n_pts_eq   = args.n_points_equil or max(30, int(2 * equil_dur))
+
+    static_csv = _static_dict(N_acids, M, beta_csv, 1.0, n_pts_sim, n_pts_eq,
+                               equil_dur, args.tau, J_max_csv, S_max_csv,
+                               args.smooth_width, no_sb_csv)
+    static_csv['start_equil'] = start_e
+
+    p_eval_csv = {
+        'pKa'            : np.array(pdata['pKa']),
+        'phi'            : float(pdata['phi']),
+        'J'              : float(pdata['J']),
+        'monomer_entropy': (np.array(pdata['monomer_entropy'])
+                            if 'monomer_entropy' in pdata else None),
+    }
+
+    target_sched  = [float(x) for x in pdata['target_pH_schedule']]
+    all_schedules = all_unique_permutations(target_sched)
+    target_idx    = all_schedules.index(target_sched)
+
+    labels  = _mn_particle_labels(N_acids, M)
+    i_idx   = static_csv['i_idx']
+    j_idx   = static_csv['j_idx']
+    acid_base_np    = static_csv['acid_base_np']
+    correct_mask_np = static_csv['correct_mask_np']
+    n_triu  = len(i_idx)
+
+    free_cols  = [f'free_{labels[i]}' for i in range(N)]
+    dimer_cols = [f'dimer_{labels[i_idx[k]]}-{labels[j_idx[k]]}' for k in range(n_triu)]
+    eq_cols    = [f'eq_{labels[i_idx[k]]}-{labels[j_idx[k]]}' for k in range(n_triu)]
+
+    def _eq_dimers(pH_val):
+        state = _bis(pH_val, np.array(p_eval_csv['pKa']),
+                     acid_base_np, correct_mask_np,
+                     float(p_eval_csv['phi']), p_eval_csv['J'],
+                     beta_csv, N, i_idx, j_idx,
+                     monomer_entropy_np=(np.array(p_eval_csv['monomer_entropy'])
+                                        if p_eval_csv.get('monomer_entropy') is not None else None),
+                     no_self_bonds=no_sb_csv)
+        return state[N:]  # dimer triu only
+
+    all_rows = []
+    print(f'  Simulating {len(all_schedules)} schedule permutations ...')
+
+    for sched_idx, sched in enumerate(all_schedules):
+        is_target = (sched_idx == target_idx)
+        equil_traj, schedule_trajs, _ = get_equil_and_schedule_traj(
+            p_eval_csv, static_csv, sched, seg_dur)
+
+        # Pre-compute equilibrium dimer concentrations per segment
+        eq_equil = _eq_dimers(7.0)
+        eq_segs  = [_eq_dimers(ph) for ph in sched]
+
+        equil_traj_np = np.array(equil_traj)
+        n_eq          = equil_traj_np.shape[0]
+        t_equil       = np.linspace(0.0, equil_dur, n_eq)
+
+        for t_i in range(n_eq):
+            state = equil_traj_np[t_i]
+            row = {'schedule': str(sched), 'is_target': is_target,
+                   'time': float(t_equil[t_i]), 'segment': 'equil', 'pH': 7.0}
+            for ci, col in enumerate(free_cols):
+                row[col] = float(state[ci])
+            for ci, col in enumerate(dimer_cols):
+                row[col] = float(state[N + ci])
+            for ci, col in enumerate(eq_cols):
+                row[col] = float(eq_equil[ci])
+            all_rows.append(row)
+
+        t_offset = equil_dur
+        for seg_i, (seg_traj, ph) in enumerate(zip(schedule_trajs, sched)):
+            seg_np = np.array(seg_traj)
+            n_pts  = seg_np.shape[0]
+            t_seg  = np.linspace(t_offset, t_offset + seg_dur, n_pts)
+            eq_d   = eq_segs[seg_i]
+            seg_label = f'pH{ph:.1f}'
+            for t_i in range(n_pts):
+                state = seg_np[t_i]
+                row = {'schedule': str(sched), 'is_target': is_target,
+                       'time': float(t_seg[t_i]), 'segment': seg_label, 'pH': float(ph)}
+                for ci, col in enumerate(free_cols):
+                    row[col] = float(state[ci])
+                for ci, col in enumerate(dimer_cols):
+                    row[col] = float(state[N + ci])
+                for ci, col in enumerate(eq_cols):
+                    row[col] = float(eq_d[ci])
+                all_rows.append(row)
+            t_offset += seg_dur
+
+    csv_path = os.path.join(outdir, 'trajectories.csv')
+    col_order = (['schedule', 'is_target', 'time', 'segment', 'pH']
+                 + free_cols + dimer_cols + eq_cols)
+    try:
+        import pandas as pd
+        df = pd.DataFrame(all_rows, columns=col_order)
+        df.to_csv(csv_path, index=False)
+    except ImportError:
+        import csv as _csv
+        with open(csv_path, 'w', newline='') as _f:
+            writer = _csv.DictWriter(_f, fieldnames=col_order)
+            writer.writeheader()
+            writer.writerows(all_rows)
+
+    print(f'  CSV saved → {csv_path}')
+    print(f'  Rows: {len(all_rows)}  |  Columns: {len(col_order)}')
+    return csv_path
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -480,6 +650,7 @@ def main():
             no_baseline          = args.no_baseline,
             weight_decay         = args.weight_decay,
             grad_clip            = args.grad_clip,
+            start_equil          = args.start_equil,
         )
 
         print('=' * 60)
@@ -541,6 +712,7 @@ def main():
         else:
             (raw_params, loss_history, score_history, param_history,
              static, all_schedules, target_idx, *_) = train(config)
+            best_config = config
 
         _fixed_pKa_eval = ([args.pKa_acid]*args.N + [args.pKa_base]*args.N
                             if args.pka_default else None)
@@ -569,6 +741,7 @@ def main():
             'fixed_phi'          : args.fixed_phi,
             'fixed_J'            : args.fixed_J,
             'pka_default'        : args.pka_default,
+            'start_equil'        : args.start_equil,
         }
         if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
             params_out['monomer_entropy'] = np.atleast_1d(
@@ -606,6 +779,9 @@ def main():
                                           args.equil_duration * _k0_anim))
         _anim_duration  = float(pdata.get('duration_per_seg',
                                           args.duration * _k0_anim))
+        _anim_start_equil = bool(pdata.get('start_equil', False))
+        if _anim_start_equil:
+            _anim_equil_dur = 0.0
         static = _static_dict(
             _N_anim, _M_anim,
             pdata['beta'], 1.0,
@@ -613,6 +789,7 @@ def main():
             _anim_equil_dur, args.tau,
             _J_max, _S_max, args.smooth_width, _nsb,
         )
+        static['start_equil'] = _anim_start_equil
         p_eval = {
             'pKa': np.array(pdata['pKa']),
             'phi': float(pdata['phi']),
@@ -701,6 +878,20 @@ def main():
         _print_param_table(p_eval, static, title='Eval Parameters')
 
     # =====================================================================
+    # CSV EXPORT
+    # =====================================================================
+    if args.mode == 'csv':
+        if not os.path.exists(params_path):
+            print(f'ERROR: params file not found: {params_path}')
+            sys.exit(1)
+        print('=' * 60)
+        print('CRN_AD  —  CSV Export')
+        print('=' * 60)
+        export_csv(params_path, outdir, args)
+        print('\nDone.')
+        return
+
+    # =====================================================================
     # SUMMARY PLOT
     # =====================================================================
     if args.mode in ('train', 'both', 'animate', 'eval'):
@@ -740,7 +931,7 @@ def main():
                                 if p_eval.get('monomer_entropy') is not None else None),
         }
 
-        _plot_config = config if args.mode in ('train', 'both') else None
+        _plot_config = (best_config if args.mode in ('train', 'both') else None)
         plot_summary(
             loss_history, score_history, param_history,
             all_schedules_local, target_idx,

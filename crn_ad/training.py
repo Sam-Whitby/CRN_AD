@@ -35,6 +35,8 @@ from functools import partial
 
 from .dynamics import (simulate_schedule, simulate_schedule_scan,
                        make_initial_state, make_triu_indices)
+from .physics import (boltzmann_initial_state as _boltzmann_initial_state,
+                       boltzmann_equilibrium_jax as _boltzmann_equilibrium_jax)
 
 
 # ---------------------------------------------------------------------------
@@ -204,23 +206,36 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
 
     # Score is computed from the FINAL state after the full schedule —
     # equil gives the starting state, then each permutation is run to completion.
-    equil_state = simulate_schedule_scan(
-        initial_state, jnp.array([7.0]), static['equil_duration'],
-        pKa_full, static['acid_base'], p['phi'], p['J'],
-        static['beta'], static['k0'],
-        static['correct_mask'], static['n'],
-        static['i_idx'], static['j_idx'],
-        n_points=static['n_points_equil'],
-        smooth_width=sw,
-        monomer_entropy=mono_s,
-        ph_initial=7.0,
-        allowed_mask=allowed_mask,
-        beta_ramp_duration=equil_ramp,
-        no_self_bonds=no_self_bonds,
-    )
-    # Clip gradient norm flowing back through the equil ODE adjoint.
-    if grad_clip is not None:
-        equil_state = _clip_grad_norm(float(grad_clip), equil_state)
+    if static.get('start_equil', False):
+        # Differentiable Boltzmann equilibrium via unrolled JAX fixed-point.
+        # Gradients flow through pKa/phi/J → equilibrium state → ODE → loss.
+        equil_state = _boltzmann_equilibrium_jax(
+            pKa_full, p['phi'], p['J'], 7.0,
+            static['acid_base'], static['correct_mask'],
+            static['beta'], static['n'],
+            static['i_idx'], static['j_idx'],
+            monomer_entropy=mono_s,
+            allowed_mask=allowed_mask,
+            no_self_bonds=no_self_bonds,
+        )
+    else:
+        equil_state = simulate_schedule_scan(
+            initial_state, jnp.array([7.0]), static['equil_duration'],
+            pKa_full, static['acid_base'], p['phi'], p['J'],
+            static['beta'], static['k0'],
+            static['correct_mask'], static['n'],
+            static['i_idx'], static['j_idx'],
+            n_points=static['n_points_equil'],
+            smooth_width=sw,
+            monomer_entropy=mono_s,
+            ph_initial=7.0,
+            allowed_mask=allowed_mask,
+            beta_ramp_duration=equil_ramp,
+            no_self_bonds=no_self_bonds,
+        )
+        # Clip gradient norm flowing back through the equil ODE adjoint.
+        if grad_clip is not None:
+            equil_state = _clip_grad_norm(float(grad_clip), equil_state)
 
     # Baseline: correct-bond fraction at the pH-7 equilibrium state, before
     # any schedule is applied.  Gradients flow back through this score so
@@ -283,9 +298,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     Compiles on first call; subsequent calls with same shapes are cached.
     """
     all_pH_array  = jnp.array(all_schedules, dtype=float)
-    initial_state = make_initial_state(static['n'])
     sw            = float(static.get('smooth_width', 0.0))
-
     allowed_mask  = static.get('allowed_mask', None)
     no_self_bonds = bool(static.get('no_self_bonds', False))
     pKa          = jnp.array(p_constrained['pKa'])  # already 2*N_acids values
@@ -293,26 +306,40 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     J            = jnp.array(p_constrained['J'])
     mono_s = (_get_monomer_entropy(p_constrained)
               if p_constrained.get('monomer_entropy') is not None else None)
-
     equil_ramp = float(static.get('equil_ramp_duration', 0.0))
+
+    _start_equil = bool(static.get('start_equil', False))
+    _dissoc_state = make_initial_state(static['n'])
 
     # JIT-compiled scoring function (traced once, cached by JAX)
     @jax.jit
     def _score_all(pKa, phi, J, all_pH_array):
-        equil = simulate_schedule_scan(
-            initial_state, jnp.array([7.0]), static['equil_duration'],
-            pKa, static['acid_base'], phi, J,
-            static['beta'], static['k0'],
-            static['correct_mask'], static['n'],
-            static['i_idx'], static['j_idx'],
-            n_points=static['n_points_equil'],
-            smooth_width=sw,
-            monomer_entropy=mono_s,
-            ph_initial=7.0,
-            allowed_mask=allowed_mask,
-            beta_ramp_duration=equil_ramp,
-            no_self_bonds=no_self_bonds,
-        )
+        if _start_equil:
+            # JAX-native differentiable Boltzmann equilibrium.
+            equil = _boltzmann_equilibrium_jax(
+                pKa, phi, J, 7.0,
+                static['acid_base'], static['correct_mask'],
+                static['beta'], static['n'],
+                static['i_idx'], static['j_idx'],
+                monomer_entropy=mono_s,
+                allowed_mask=allowed_mask,
+                no_self_bonds=no_self_bonds,
+            )
+        else:
+            equil = simulate_schedule_scan(
+                _dissoc_state, jnp.array([7.0]), static['equil_duration'],
+                pKa, static['acid_base'], phi, J,
+                static['beta'], static['k0'],
+                static['correct_mask'], static['n'],
+                static['i_idx'], static['j_idx'],
+                n_points=static['n_points_equil'],
+                smooth_width=sw,
+                monomer_entropy=mono_s,
+                ph_initial=7.0,
+                allowed_mask=allowed_mask,
+                beta_ramp_duration=equil_ramp,
+                no_self_bonds=no_self_bonds,
+            )
 
         baseline = correct_bond_score(equil, static['n'],
                                       static['correct_triu_idx'])
@@ -380,6 +407,7 @@ def train(config):
     j_init_max     = bool(config.get('j_init_max', False))
     phi_init_max   = bool(config.get('phi_init_max', False))
     verbose        = bool(config.get('verbose', True))
+    start_equil    = bool(config.get('start_equil', False))
     fixed_phi_val  = config.get('fixed_phi', None)
     if fixed_phi_val is not None:
         fixed_phi_val = float(np.clip(fixed_phi_val, 0.0, 1.0))
@@ -452,7 +480,12 @@ def train(config):
         'equil_ramp_duration': float(config.get('equil_duration', 80.0)) / 2.0,
         'grad_clip'          : (float(config['grad_clip'])
                                 if config.get('grad_clip') is not None else None),
+        'start_equil'        : start_equil,
     }
+    # When starting from Boltzmann equilibrium there is no ODE equil phase;
+    # set equil_duration to 0 so visualisation shows no equil segment.
+    if start_equil:
+        static['equil_duration'] = 0.0
 
     # ------------------------------------------------------------------
     # Schedules
@@ -471,7 +504,10 @@ def train(config):
         print(f"Particles    : {N}  ({N_acids} acids + {N_acids} bases)")
         print(f"Target sched : {target_sched}")
         print(f"Permutations : {len(all_schedules)}  (target idx = {target_idx})")
-        print(f"Equilibration: pH 7,  t = {static['equil_duration']} (β=1)")
+        if start_equil:
+            print(f"Equilibration: Boltzmann (pH 7, ODE skipped, recomputed each epoch)")
+        else:
+            print(f"Equilibration: pH 7,  t = {static['equil_duration']} (β=1)")
         print(f"J_max        : {J_max}  kT")
         if j_init_max:
             print(f"J_init       : {J_max * 0.9:.3g}  kT  (--J_init_max, 90% of J_max)")
@@ -541,10 +577,9 @@ def train(config):
 
     raw_params = unconstrain_params(init_phys, J_max=J_max, S_max=S_max)
 
-    # All monomers free at equal concentration, no dimers: this is the fully
-    # unattached state used as the starting point before every equilibration.
-    # Fixed for the entire training run — every gradient step recomputes from
-    # here, so there is no state carry-over between epochs.
+    # The fully-dissociated state is passed when start_equil=False.
+    # When start_equil=True, compute_loss calls boltzmann_equilibrium_jax
+    # internally from raw_params, so initial_state is not used.
     initial_state = make_initial_state(N)
 
     # ------------------------------------------------------------------
@@ -674,18 +709,30 @@ def train(config):
                                fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
                                fixed_pKa=fixed_pKa_val)
     mono_s   = _get_monomer_entropy(p_final)
-    pKa_full = p_final['pKa']  # already 2*N_acids values, one per particle
-    equil_state = simulate_schedule_scan(
-        initial_state, jnp.array([7.0]), static['equil_duration'],
-        pKa_full, static['acid_base'], p_final['phi'], p_final['J'],
-        static['beta'], static['k0'],
-        static['correct_mask'], static['n'], static['i_idx'], static['j_idx'],
-        n_points=static['n_points_equil'],
-        smooth_width=smooth, monomer_entropy=mono_s, ph_initial=7.0,
-        allowed_mask=allowed_mask_jax,
-        beta_ramp_duration=static['equil_ramp_duration'],
-        no_self_bonds=no_self_bonds,
-    )
+    pKa_full = p_final['pKa']
+    if start_equil:
+        # Numpy fixed-point (no gradient needed for the return value).
+        equil_state = jnp.array(_boltzmann_initial_state(
+            7.0, np.array(pKa_full),
+            static['acid_base_np'], static['correct_mask_np'],
+            float(p_final['phi']), np.array(p_final['J']),
+            static['beta'], N,
+            static['i_idx'], static['j_idx'],
+            monomer_entropy_np=(np.array(mono_s) if mono_s is not None else None),
+            no_self_bonds=no_self_bonds,
+        ))
+    else:
+        equil_state = simulate_schedule_scan(
+            initial_state, jnp.array([7.0]), static['equil_duration'],
+            pKa_full, static['acid_base'], p_final['phi'], p_final['J'],
+            static['beta'], static['k0'],
+            static['correct_mask'], static['n'], static['i_idx'], static['j_idx'],
+            n_points=static['n_points_equil'],
+            smooth_width=smooth, monomer_entropy=mono_s, ph_initial=7.0,
+            allowed_mask=allowed_mask_jax,
+            beta_ramp_duration=static['equil_ramp_duration'],
+            no_self_bonds=no_self_bonds,
+        )
 
     return (raw_params, loss_history, score_history, param_history,
             static, all_schedules, target_idx, equil_state,

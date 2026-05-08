@@ -29,6 +29,22 @@ def _particle_labels(n_species, T):
         return [SPECIES_NAMES[s] for s in range(n_species)]
     return [f'{SPECIES_NAMES[s]}{t + 1}' for s in range(n_species) for t in range(T)]
 
+
+def _mn_particle_labels(N_total, M):
+    """Labels for M/N model: N_total acid + N_total base particles.
+
+    Classifier acids A1..AM (indices 0..M-1),
+    Roughness acids a1..a(N-M) (indices M..N-1),
+    Classifier bases B1..BM (indices N..N+M-1),
+    Roughness bases b1..b(N-M) (indices N+M..2N-1).
+    """
+    labels = []
+    for i in range(N_total):
+        labels.append(f'A{i+1}' if i < M else f'a{i-M+1}')
+    for i in range(N_total):
+        labels.append(f'B{i+1}' if i < M else f'b{i-M+1}')
+    return labels
+
 _CMAP_CHARGE = plt.cm.RdBu_r
 _NORM_CHARGE = Normalize(vmin=-1.0, vmax=1.0)
 
@@ -50,12 +66,18 @@ _TAB20B = plt.cm.tab20b(np.linspace(0, 1, 20))
 _TAB20C = plt.cm.tab20c(np.linspace(0, 1, 20))
 _PALETTE = np.concatenate([_TAB20B, _TAB20C], axis=0)
 
-# Visually distinct colors for correct dimers — consistent across all panels
+# M/N model colour scheme by particle role
+_CLF_ACID_COLORS = ['#c0392b', '#922b21', '#7b241c', '#641e16']   # dark reds — classifier acids
+_RGH_ACID_COLORS = ['#e67e22', '#f0a500', '#d68910', '#b7770d']   # oranges — roughness acids
+_CLF_BASE_COLORS = ['#2980b9', '#1a5276', '#154360', '#1f618d']   # dark blues — classifier bases
+_RGH_BASE_COLORS = ['#5dade2', '#85c1e9', '#76d7c4', '#48c9b0']   # light blue/cyan — roughness bases
+
+# Correct dimer individual lines — purples/teals to avoid clashing with aggregate red/green lines
 _CORRECT_DIMER_COLORS = [
-    '#e74c3c', '#3498db', '#2ecc71', '#f39c12',
-    '#9b59b6', '#1abc9c', '#e67e22', '#34495e',
-    '#c0392b', '#2980b9', '#27ae60', '#8e44ad',
-    '#16a085', '#d35400', '#7f8c8d', '#2c3e50',
+    '#8e44ad', '#16a085', '#d35400', '#1abc9c',
+    '#9b59b6', '#2ecc71', '#f39c12', '#34495e',
+    '#7d3c98', '#117a65', '#a04000', '#1d8348',
+    '#784212', '#2e4057', '#6c3483', '#0e6655',
 ]
 
 
@@ -66,6 +88,18 @@ def _correct_dimer_color(correct_idx):
 
 def _species_color(i):
     return _PALETTE[i % len(_PALETTE)]
+
+
+def _mn_particle_style(i, N_total, M):
+    """Return (color, linestyle, linewidth) for particle i in the M/N model."""
+    if i < M:
+        return _CLF_ACID_COLORS[i % len(_CLF_ACID_COLORS)], '-', 2.5
+    elif i < N_total:
+        return _RGH_ACID_COLORS[(i - M) % len(_RGH_ACID_COLORS)], '--', 1.2
+    elif i < N_total + M:
+        return _CLF_BASE_COLORS[(i - N_total) % len(_CLF_BASE_COLORS)], '-', 2.5
+    else:
+        return _RGH_BASE_COLORS[(i - N_total - M) % len(_RGH_BASE_COLORS)], '--', 1.2
 
 
 def _dimer_color(ii, jj, n, correct_mask_np, T=1):
@@ -374,7 +408,12 @@ def plot_summary(loss_history, score_history, param_history,
     n               = static['n']
     n_species       = static.get('n_species', n)  # = 2*N_acids in M/N model
     T               = static.get('T', 1)          # = 1 in M/N model
-    plabels         = _particle_labels(n_species, T)
+    _N_total_ps     = static.get('N_total', n_species // 2)
+    _M_clf_ps       = static.get('M_classifier', _N_total_ps)
+    if T == 1 and _N_total_ps is not None and _M_clf_ps is not None:
+        plabels = _mn_particle_labels(_N_total_ps, _M_clf_ps)
+    else:
+        plabels = _particle_labels(n_species, T)
     i_idx, j_idx    = static['i_idx'], static['j_idx']
     correct_mask_np = static['correct_mask_np']
     acid_base       = np.array(static['acid_base'])
@@ -449,12 +488,10 @@ def plot_summary(loss_history, score_history, param_history,
     # Panel 2 — pKa evolution  (one curve per species, shared across types)
     # -------------------------------------------------------------------
     for i in range(n_species):
-        ab = 'base' if acid_base[i] == 1 else 'acid'
+        col, ls, lw = _mn_particle_style(i, _N_total_ps, _M_clf_ps)
         ax_pka.plot(epochs, pKa_hist[:, i],
-                    color=_species_color(i),
-                    linestyle=ls_cycle[i % len(ls_cycle)],
-                    linewidth=2,
-                    label=f'{SPECIES_NAMES[i]} ({ab})')
+                    color=col, linestyle=ls, linewidth=lw,
+                    label=plabels[i])
     ax_pka.set_ylim(3, 10)
     ax_pka.set_xlabel('Epoch', fontsize=11)
     ax_pka.set_ylabel('pKa', fontsize=11)
@@ -522,10 +559,7 @@ def plot_summary(loss_history, score_history, param_history,
                      label=f'[{plabels[ii]}–{plabels[jj]}] ✓')
         correct_count += 1
 
-    # Total monomer content M(t) ≡ 1
     M_t = all_st[:, :n].sum(1) + 2.0 * all_st[:, n:].sum(1)
-    ax_conc.plot(t_all, M_t, 'k--', linewidth=2.0,
-                 label='M(t) total (≡1)')
 
     # Aggregate dimer lines
     correct_triu   = [k for k, (ii, jj) in enumerate(zip(i_idx, j_idx))
@@ -630,36 +664,69 @@ def plot_summary(loss_history, score_history, param_history,
                    ha='center', va='top', fontsize=8, color='#8e44ad')
 
     # -------------------------------------------------------------------
-    # Panel 5 — ΔG vs pH
+    # Panel 5 — ΔG vs pH (correct bonds + competitor ensembles)
     # -------------------------------------------------------------------
     pHs = np.linspace(2, 12, 300)
     mono_entropy = trained_params.get('monomer_entropy', None)
     mono_arr     = (np.array(mono_entropy) if mono_entropy is not None else None)
+    N_total_dG   = static.get('N_total', n_species // 2)
+    M_clf_dG     = static.get('M_classifier', N_total_dG)
+    n_rgh_dG     = N_total_dG - M_clf_dG
+    _mn_lbls_dG  = _mn_particle_labels(N_total_dG, M_clf_dG)
 
-    correct_count_dG = 0
-    for k in range(n_triu):
-        ii, jj = int(i_idx[k]), int(j_idx[k])
-        # Only show correct bonds in the dG panel
-        if not correct_mask_np[ii, jj]:
-            continue
-        qs = np.array([
-            float(henderson_hasselbalch(jnp.array(pKa_full), ph, jnp.array(acid_base))[ii]) *
-            float(henderson_hasselbalch(jnp.array(pKa_full), ph, jnp.array(acid_base))[jj])
-            for ph in pHs
-        ])
-        J_ij    = float(J_arr[ii, jj]) if J is None else J
-        dG_line = J_ij * qs
+    # Pre-compute charge arrays for all particles across pH sweep
+    def _charges_at(ph):
+        return np.array(henderson_hasselbalch(
+            jnp.array(pKa_full), ph, jnp.array(acid_base)))
+
+    charges_grid = np.array([_charges_at(ph) for ph in pHs])  # (n_pH, n)
+
+    def _dG_arr(ii, jj, is_correct):
+        J_ij  = float(J_arr[ii, jj]) if J is None else J
+        scale = 1.0 if is_correct else phi
+        line  = scale * J_ij * charges_grid[:, ii] * charges_grid[:, jj]
         if mono_arr is not None:
             si = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[ii])
             sj = float(mono_arr[0] if len(mono_arr) == 1 else mono_arr[jj])
-            dG_line = dG_line + si + sj
-        col = _correct_dimer_color(correct_count_dG)
-        lbl = f'{plabels[ii]}–{plabels[jj]} ✓'
-        ax_dG.plot(pHs, dG_line, color=col, linewidth=2.2, linestyle='-', label=lbl)
-        correct_count_dG += 1
+            line = line + si + sj
+        return line
+
+    # 1) Correct bonds — solid lines, distinct colors
+    for clf_idx in range(M_clf_dG):
+        ii  = clf_idx
+        jj  = N_total_dG + clf_idx
+        col = _correct_dimer_color(clf_idx)
+        ax_dG.plot(pHs, _dG_arr(ii, jj, True),
+                   color=col, linewidth=2.5, linestyle='-',
+                   label=f'{_mn_lbls_dG[ii]}–{_mn_lbls_dG[jj]} ✓')
+
+    # 2) Classifier acid vs Σ roughness bases — dashed, red shades
+    for clf_idx in range(M_clf_dG):
+        ii = clf_idx
+        if n_rgh_dG > 0:
+            sum_dg = np.zeros(len(pHs))
+            for rgh_idx in range(n_rgh_dG):
+                jj = N_total_dG + M_clf_dG + rgh_idx
+                sum_dg += _dG_arr(ii, jj, False)
+            col = _CLF_ACID_COLORS[clf_idx % len(_CLF_ACID_COLORS)]
+            ax_dG.plot(pHs, sum_dg, color=col, linewidth=1.8, linestyle='--',
+                       label=f'{_mn_lbls_dG[ii]}–Σb (competitors)')
+
+    # 3) Classifier base vs Σ roughness acids — dashed, blue shades
+    for clf_idx in range(M_clf_dG):
+        jj = N_total_dG + clf_idx
+        if n_rgh_dG > 0:
+            sum_dg = np.zeros(len(pHs))
+            for rgh_idx in range(n_rgh_dG):
+                ii = M_clf_dG + rgh_idx
+                sum_dg += _dG_arr(ii, jj, False)
+            col = _CLF_BASE_COLORS[clf_idx % len(_CLF_BASE_COLORS)]
+            ax_dG.plot(pHs, sum_dg, color=col, linewidth=1.8, linestyle='--',
+                       label=f'{_mn_lbls_dG[jj]}–Σa (competitors)')
+
     ax_dG.axhline(0, color='black', linewidth=0.7)
     for pH_v in pH_schedule:
-        ax_dG.axvline(pH_v, color='#e74c3c', linewidth=0.9, linestyle=':', alpha=0.7)
+        ax_dG.axvline(pH_v, color='grey', linewidth=0.9, linestyle=':', alpha=0.7)
     ax_dG.set_xlabel('pH', fontsize=11)
     ax_dG.set_ylabel('ΔG  (kT)', fontsize=11)
     ax_dG.set_title('Dimer free energy vs pH', fontsize=11)
@@ -768,11 +835,11 @@ def plot_summary(loss_history, score_history, param_history,
              '',
              ' Parameters (final)',
     ]
-    # pKa lines — n_species = 2*N_total in M/N model, T=1
+    _mn_lbls_tbl = _mn_particle_labels(N_total, M_clf)
     for i in range(n_species):
         role = 'base' if acid_base[i] == 1 else 'acid'
         tag  = '  [fixed]' if _fpK is not None else ''
-        lines.append(f'   pKa {SPECIES_NAMES[i % 26]} ({role})  {float(_pKa_np[i]):.4f}{tag}')
+        lines.append(f'   pKa {_mn_lbls_tbl[i]:<4} ({role})  {float(_pKa_np[i]):.4f}{tag}')
     lines.append(f'   phi         {_phi_val:.4f}'
                  + ('  [fixed]' if _fp is not None else ''))
     lines.append(f'   J           {_J_val:.4f}  kT'
