@@ -83,6 +83,12 @@ def build_parser():
                         'running a kinetic ODE equilibration.  Sets equil_duration to 0 '
                         'for visualisation purposes.  Useful for studying discrimination '
                         'from a pre-equilibrated initial condition.')
+    p.add_argument('--post_duration', type=float, default=0.0,
+                   help='After each pH schedule, return to pH 7 and simulate for this '
+                        'many time units.  Scores are computed as the time-averaged '
+                        'correct-dimer concentration over (schedule + post) duration, '
+                        'i.e. ∫[correct dimers] dt / (schedule_dur + post_dur).  '
+                        'Default 0.0 = use the final-state score (original behaviour).')
     p.add_argument('--n_epochs', type=int, default=300)
     p.add_argument('--lr', type=float, default=0.02, help='Adam learning rate.')
     p.add_argument('--beta', type=float, default=1.0,
@@ -313,34 +319,32 @@ def _static_dict(N_acids, M, beta, k0, n_points_sim, n_points_equil,
 
 
 def get_equil_and_schedule_traj(p, static, target_sched, duration):
-    """Run pH-7 equilibration then target schedule; return trajectories."""
+    """Run pH-7 equilibration then target schedule; return trajectories.
+
+    Returns (equil_traj, schedule_trajs, final_state, post_traj).
+    post_traj is None when post_duration == 0.
+    """
     from crn_ad.physics import boltzmann_initial_state as _bis
-    n            = static['n']
+    n             = static['n']
     allowed_mask  = static.get('allowed_mask', None)
     no_self_bonds = bool(static.get('no_self_bonds', False))
     mono_s        = _get_mono(p, static)
+    post_duration = float(static.get('post_duration', 0.0))
+    n_pts_post    = int(static.get('n_points_post', max(20, int(2 * post_duration))))
 
-    # pKa already has one value per particle (2*N_acids elements)
     pKa_full = jnp.array(p['pKa'])
 
     if static.get('start_equil', False):
-        # Compute Boltzmann equilibrium at pH 7 — no ODE needed.
         equil_final = jnp.array(_bis(
-            7.0,
-            np.array(p['pKa']),
-            static['acid_base_np'],
-            static['correct_mask_np'],
-            float(p['phi']),
-            p['J'],
-            static['beta'],
-            n,
-            static['i_idx'],
-            static['j_idx'],
+            7.0, np.array(p['pKa']),
+            static['acid_base_np'], static['correct_mask_np'],
+            float(p['phi']), p['J'], static['beta'], n,
+            static['i_idx'], static['j_idx'],
             monomer_entropy_np=(np.array(p['monomer_entropy'])
                                 if p.get('monomer_entropy') is not None else None),
             no_self_bonds=no_self_bonds,
         ))
-        equil_traj_data = np.array(equil_final)[np.newaxis, :]  # (1, state_size)
+        equil_traj_data = np.array(equil_final)[np.newaxis, :]
     else:
         equil_ramp = float(static.get('equil_ramp_duration', 0.0))
         equil_final, equil_traj = simulate_schedule(
@@ -368,7 +372,24 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
         allowed_mask=allowed_mask,
         no_self_bonds=no_self_bonds,
     )
-    return equil_traj_data, schedule_trajs, final_state
+
+    if post_duration > 0:
+        _, post_traj_list = simulate_schedule(
+            final_state, [7.0], post_duration,
+            pKa_full, static['acid_base'],
+            jnp.array(p['phi']), jnp.array(p['J']),
+            static['beta'], static['k0'],
+            static['correct_mask'], n, static['i_idx'], static['j_idx'],
+            n_points=n_pts_post,
+            monomer_entropy=mono_s,
+            allowed_mask=allowed_mask,
+            no_self_bonds=no_self_bonds,
+        )
+        post_traj = np.array(post_traj_list[0])
+    else:
+        post_traj = None
+
+    return equil_traj_data, schedule_trajs, final_state, post_traj
 
 
 def _get_mono(p, static):
@@ -540,7 +561,7 @@ def export_csv(params_path, outdir, args):
 
     for sched_idx, sched in enumerate(all_schedules):
         is_target = (sched_idx == target_idx)
-        equil_traj, schedule_trajs, _ = get_equil_and_schedule_traj(
+        equil_traj, schedule_trajs, _, _post_csv = get_equil_and_schedule_traj(
             p_eval_csv, static_csv, sched, seg_dur)
 
         # Pre-compute equilibrium dimer concentrations per segment
@@ -651,6 +672,7 @@ def main():
             weight_decay         = args.weight_decay,
             grad_clip            = args.grad_clip,
             start_equil          = args.start_equil,
+            post_duration        = args.post_duration,
         )
 
         print('=' * 60)
@@ -742,6 +764,7 @@ def main():
             'fixed_J'            : args.fixed_J,
             'pka_default'        : args.pka_default,
             'start_equil'        : args.start_equil,
+            'post_duration'      : args.post_duration,
         }
         if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
             params_out['monomer_entropy'] = np.atleast_1d(
@@ -789,7 +812,10 @@ def main():
             _anim_equil_dur, args.tau,
             _J_max, _S_max, args.smooth_width, _nsb,
         )
-        static['start_equil'] = _anim_start_equil
+        static['start_equil']   = _anim_start_equil
+        _anim_post_dur = float(pdata.get('post_duration', args.post_duration))
+        static['post_duration'] = _anim_post_dur
+        static['n_points_post'] = max(20, int(2 * _anim_post_dur))
         p_eval = {
             'pKa': np.array(pdata['pKa']),
             'phi': float(pdata['phi']),
@@ -857,6 +883,8 @@ def main():
             args.J_max, S_max_eval, args.smooth_width,
             args.no_self_bonds,
         )
+        static['post_duration'] = args.post_duration
+        static['n_points_post'] = max(20, int(2 * args.post_duration))
         p_eval = {
             'pKa'            : np.array(args.eval_pKa),
             'phi'            : float(args.eval_phi),
@@ -910,7 +938,7 @@ def main():
         else:  # eval
             _eff_duration = args.duration
 
-        equil_traj, schedule_trajs, _ = get_equil_and_schedule_traj(
+        equil_traj, schedule_trajs, _, post_traj = get_equil_and_schedule_traj(
             p_eval, static, target_sched, _eff_duration)
 
         # Fast vmap-based scoring — compiles once, runs in parallel
@@ -931,6 +959,7 @@ def main():
                                 if p_eval.get('monomer_entropy') is not None else None),
         }
 
+        _post_duration_plot = float(static.get('post_duration', 0.0))
         _plot_config = (best_config if args.mode in ('train', 'both') else None)
         plot_summary(
             loss_history, score_history, param_history,
@@ -940,6 +969,8 @@ def main():
             static, trained_params, final_scores,
             save_path=summary_path,
             config=_plot_config,
+            post_traj=post_traj,
+            post_duration=_post_duration_plot,
         )
 
         print(f'\nSummary plot → {summary_path}')
@@ -967,7 +998,7 @@ def main():
                 [all_schedules[target_idx]] +
                 [s for i, s in enumerate(all_schedules) if i != target_idx][:2]):
             label = 'target' if s_idx == 0 else f'perm{s_idx}'
-            equil_t, sched_trajs, _ = get_equil_and_schedule_traj(
+            equil_t, sched_trajs, _, _post_anim = get_equil_and_schedule_traj(
                 p_eval, static, sched, _eff_duration)
             gif = os.path.join(outdir, f'animation_{label}.gif')
             try:

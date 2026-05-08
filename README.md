@@ -72,7 +72,13 @@ The state vector holds all free-monomer concentrations and upper-triangle dimer 
 
 2. **Record the baseline score**: the correct-bond fraction at the end of pH-7 equilibration.
 
-3. **Score each unique permutation** of the target pH schedule from the equilibrated state.
+3. **Score each unique permutation** of the target pH schedule from the equilibrated state. The score is either:
+   - **Final-state score** (default, `--post_duration 0`): correct-dimer fraction Σ[Ai·Bi] / (M/2N) at the end of the schedule.
+   - **Integral score** (`--post_duration > 0`): time-averaged correct-dimer concentration integrated over the entire schedule *plus* a subsequent pH-7 post-equilibration phase of length `post_duration`. Formally:
+     ```
+     score = (1 / (T_sched + T_post)) · ∫₀^{T_sched+T_post} Σ[Ai·Bi](t) dt
+     ```
+     Normalised by the maximum possible dimer concentration M/2N. This rewards schedules that produce a sustained high level of correct dimers, not just a transient spike at the end.
 
 4. **Compute loss** (InfoNCE-style cross-entropy):
 
@@ -185,6 +191,19 @@ python main.py --mode eval --N 2 --M 1 --target_pH 9 5 7 \
   --eval_pKa 7.5 5.0 9.5 7.0 --eval_phi 0.15 --eval_J 3.5
 ```
 
+### Integral scoring with post-equilibration phase
+
+```bash
+# Score each schedule by the time-averaged correct-dimer level over the
+# full schedule *plus* a 30-unit pH-7 post-equilibration window.
+python main.py --N 4 --M 2 --n_epochs 300 --post_duration 30
+
+# Combine with Boltzmann initialisation
+python main.py --N 4 --M 2 --n_epochs 300 --start_equil --post_duration 30
+```
+
+The concentration panel in `summary.png` will show the post-equilibration window shaded in purple, and the score bar chart will reflect the integral metric.
+
 ### Large J with smooth transitions
 
 ```bash
@@ -245,6 +264,7 @@ python main.py --J_max 10.0 --smooth_width 2.0 --J_init_max
 | `--weight_decay` | `0.0` | AdamW L2 weight decay on raw parameters. |
 | `--grad_clip VALUE` | off | Clip gradient norm through each ODE call. |
 | `--no_baseline` | off | Exclude pH-7 baseline from loss. |
+| `--post_duration` | `0.0` | After each pH schedule, return to pH 7 and simulate for this many time units. Scores are computed as the duration-weighted time-averaged correct-dimer concentration over (schedule + post) phases. Setting to 0 (default) uses the original final-state score. |
 
 ### Initialisation
 
@@ -272,7 +292,7 @@ python main.py --J_max 10.0 --smooth_width 2.0 --J_init_max
 - **φ and J evolution**: parameter trajectories during training.
 - **Concentration panel**: correct dimer species (individual lines, purple/teal shades) and aggregate Σ-correct (green solid) and Σ-incorrect (red solid) with Boltzmann equilibrium reference lines (dotted same color).
 - **ΔG vs pH panel**: free energy curves for (1) each correct bond A*i*–B*i* (solid colored), (2) each classifier acid vs Σ roughness bases (dashed red, represents total competitor load), (3) each classifier base vs Σ roughness acids (dashed blue).
-- **Score bar chart**: final correct-bond fraction for all schedule permutations (green = target, red = others, grey = pH-7 baseline).
+- **Score bar chart**: correct-bond score for all schedule permutations (green = target, red = others, grey = pH-7 baseline). With `--post_duration > 0`, scores are the duration-weighted time integral over (schedule + post) phases; otherwise the final-state correct-dimer fraction.
 - **Parameter table**: complete system and training configuration.
 
 ---

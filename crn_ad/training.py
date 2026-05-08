@@ -148,6 +148,34 @@ def correct_bond_score(state, n, correct_triu_idx):
     return correct / (max_possible + 1e-10)
 
 
+def integral_bond_score(sched_trajs, post_traj, sched_dur_total, post_dur,
+                        n, correct_triu_idx):
+    """Time-averaged correct-dimer fraction over schedule + post phases.
+
+    sched_trajs     : (n_segs, n_pts_sched, state_size) — schedule trajectories
+    post_traj       : (n_pts_post, state_size)           — post-duration trajectory
+    sched_dur_total : total duration of all schedule segments (Python float)
+    post_dur        : duration of post phase (Python float)
+
+    The score is the duration-weighted mean of Σcorrect_dimers, normalised by
+    the same max-possible factor as correct_bond_score (M/2N assuming total=1).
+    """
+    sched_correct = jnp.sum(
+        sched_trajs[:, :, n:][:, :, correct_triu_idx], axis=-1)   # (n_segs, n_pts)
+    sched_avg = jnp.mean(sched_correct)
+
+    post_correct = jnp.sum(
+        post_traj[:, n:][:, correct_triu_idx], axis=-1)            # (n_pts_post,)
+    post_avg = jnp.mean(post_correct)
+
+    total_dur    = sched_dur_total + post_dur
+    weighted_avg = (sched_avg * sched_dur_total + post_avg * post_dur) / total_dur
+
+    n_clf        = correct_triu_idx.shape[0]
+    max_possible = float(n_clf) / float(n)
+    return weighted_avg / (max_possible + 1e-10)
+
+
 def total_monomer_content(state, n):
     """M(t) = Σᵢ[Xᵢ] + 2·Σ_{i≤j}[XᵢXⱼ] — conserved at 1."""
     return jnp.sum(state[:n]) + 2.0 * jnp.sum(state[n:])
@@ -243,24 +271,65 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     baseline_score = correct_bond_score(equil_state, static['n'],
                                         static['correct_triu_idx'])
 
+    _post_dur    = float(static.get('post_duration', 0.0))
+    _n_pts_post  = int(static.get('n_points_post', 20))
+    _n_segs      = int(all_pH_schedules_array.shape[1])  # pH steps per schedule
+
     def score_one(pH_sched):
-        final = simulate_schedule_scan(
-            equil_state, pH_sched, duration_per_seg,
-            pKa_full, static['acid_base'], p['phi'], p['J'],
-            static['beta'], static['k0'],
-            static['correct_mask'], static['n'],
-            static['i_idx'], static['j_idx'],
-            n_points=static['n_points_sim'],
-            smooth_width=sw,
-            monomer_entropy=mono_s,
-            ph_initial=7.0,
-            allowed_mask=allowed_mask,
-            no_self_bonds=no_self_bonds,
-        )
-        # Clip gradient norm flowing back through each schedule ODE adjoint.
-        if grad_clip is not None:
-            final = _clip_grad_norm(float(grad_clip), final)
-        return correct_bond_score(final, static['n'], static['correct_triu_idx'])
+        if _post_dur > 0.0:
+            final, all_trajs = simulate_schedule_scan(
+                equil_state, pH_sched, duration_per_seg,
+                pKa_full, static['acid_base'], p['phi'], p['J'],
+                static['beta'], static['k0'],
+                static['correct_mask'], static['n'],
+                static['i_idx'], static['j_idx'],
+                n_points=static['n_points_sim'],
+                smooth_width=sw,
+                monomer_entropy=mono_s,
+                ph_initial=7.0,
+                allowed_mask=allowed_mask,
+                no_self_bonds=no_self_bonds,
+                return_traj=True,
+            )
+            if grad_clip is not None:
+                final = _clip_grad_norm(float(grad_clip), final)
+            _, post_trajs = simulate_schedule_scan(
+                final, jnp.array([7.0]), _post_dur,
+                pKa_full, static['acid_base'], p['phi'], p['J'],
+                static['beta'], static['k0'],
+                static['correct_mask'], static['n'],
+                static['i_idx'], static['j_idx'],
+                n_points=_n_pts_post,
+                smooth_width=sw,
+                monomer_entropy=mono_s,
+                ph_initial=None,
+                allowed_mask=allowed_mask,
+                no_self_bonds=no_self_bonds,
+                return_traj=True,
+            )
+            post_traj = post_trajs[0]   # (n_pts_post, state_size)
+            return integral_bond_score(
+                all_trajs, post_traj,
+                float(_n_segs) * duration_per_seg, _post_dur,
+                static['n'], static['correct_triu_idx'],
+            )
+        else:
+            final = simulate_schedule_scan(
+                equil_state, pH_sched, duration_per_seg,
+                pKa_full, static['acid_base'], p['phi'], p['J'],
+                static['beta'], static['k0'],
+                static['correct_mask'], static['n'],
+                static['i_idx'], static['j_idx'],
+                n_points=static['n_points_sim'],
+                smooth_width=sw,
+                monomer_entropy=mono_s,
+                ph_initial=7.0,
+                allowed_mask=allowed_mask,
+                no_self_bonds=no_self_bonds,
+            )
+            if grad_clip is not None:
+                final = _clip_grad_norm(float(grad_clip), final)
+            return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
     scores     = jax.vmap(score_one)(all_pH_schedules_array)
     tau        = static.get('tau', 5.0)
@@ -308,14 +377,16 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
               if p_constrained.get('monomer_entropy') is not None else None)
     equil_ramp = float(static.get('equil_ramp_duration', 0.0))
 
-    _start_equil = bool(static.get('start_equil', False))
+    _start_equil  = bool(static.get('start_equil', False))
     _dissoc_state = make_initial_state(static['n'])
+    _post_dur_f   = float(static.get('post_duration', 0.0))
+    _n_pts_post_f = int(static.get('n_points_post', 20))
+    _n_segs_f     = int(all_pH_array.shape[1])
 
     # JIT-compiled scoring function (traced once, cached by JAX)
     @jax.jit
     def _score_all(pKa, phi, J, all_pH_array):
         if _start_equil:
-            # JAX-native differentiable Boltzmann equilibrium.
             equil = _boltzmann_equilibrium_jax(
                 pKa, phi, J, 7.0,
                 static['acid_base'], static['correct_mask'],
@@ -345,19 +416,54 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                                       static['correct_triu_idx'])
 
         def score_one(pH_sched):
-            final = simulate_schedule_scan(
-                equil, pH_sched, duration_per_seg,
-                pKa, static['acid_base'], phi, J,
-                static['beta'], static['k0'],
-                static['correct_mask'], static['n'],
-                static['i_idx'], static['j_idx'],
-                n_points=static['n_points_sim'],
-                smooth_width=sw,
-                monomer_entropy=mono_s,
-                allowed_mask=allowed_mask,
-                no_self_bonds=no_self_bonds,
-            )
-            return correct_bond_score(final, static['n'], static['correct_triu_idx'])
+            if _post_dur_f > 0.0:
+                final, all_trajs = simulate_schedule_scan(
+                    equil, pH_sched, duration_per_seg,
+                    pKa, static['acid_base'], phi, J,
+                    static['beta'], static['k0'],
+                    static['correct_mask'], static['n'],
+                    static['i_idx'], static['j_idx'],
+                    n_points=static['n_points_sim'],
+                    smooth_width=sw,
+                    monomer_entropy=mono_s,
+                    allowed_mask=allowed_mask,
+                    no_self_bonds=no_self_bonds,
+                    return_traj=True,
+                )
+                _, post_trajs = simulate_schedule_scan(
+                    final, jnp.array([7.0]), _post_dur_f,
+                    pKa, static['acid_base'], phi, J,
+                    static['beta'], static['k0'],
+                    static['correct_mask'], static['n'],
+                    static['i_idx'], static['j_idx'],
+                    n_points=_n_pts_post_f,
+                    smooth_width=sw,
+                    monomer_entropy=mono_s,
+                    ph_initial=None,
+                    allowed_mask=allowed_mask,
+                    no_self_bonds=no_self_bonds,
+                    return_traj=True,
+                )
+                post_traj = post_trajs[0]
+                return integral_bond_score(
+                    all_trajs, post_traj,
+                    float(_n_segs_f) * duration_per_seg, _post_dur_f,
+                    static['n'], static['correct_triu_idx'],
+                )
+            else:
+                final = simulate_schedule_scan(
+                    equil, pH_sched, duration_per_seg,
+                    pKa, static['acid_base'], phi, J,
+                    static['beta'], static['k0'],
+                    static['correct_mask'], static['n'],
+                    static['i_idx'], static['j_idx'],
+                    n_points=static['n_points_sim'],
+                    smooth_width=sw,
+                    monomer_entropy=mono_s,
+                    allowed_mask=allowed_mask,
+                    no_self_bonds=no_self_bonds,
+                )
+                return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
         sched_scores = jax.vmap(score_one)(all_pH_array)
         return jnp.append(sched_scores, baseline)
@@ -481,6 +587,8 @@ def train(config):
         'grad_clip'          : (float(config['grad_clip'])
                                 if config.get('grad_clip') is not None else None),
         'start_equil'        : start_equil,
+        'post_duration'      : float(config.get('post_duration', 0.0)),
+        'n_points_post'      : max(20, int(2 * float(config.get('post_duration', 0.0)))),
     }
     # When starting from Boltzmann equilibrium there is no ODE equil phase;
     # set equil_duration to 0 so visualisation shows no equil segment.

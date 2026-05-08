@@ -393,7 +393,9 @@ def plot_summary(loss_history, score_history, param_history,
                  static, trained_params,
                  final_scores,
                  save_path='summary.png',
-                 config=None):
+                 config=None,
+                 post_traj=None,
+                 post_duration=0.0):
     """
     Summary figure.
 
@@ -531,14 +533,20 @@ def plot_summary(loss_history, score_history, param_history,
     # -------------------------------------------------------------------
     # Panel 4 — Concentration time series with pH overlay
     # -------------------------------------------------------------------
-    equil_states = np.array(equil_traj)
-    t_equil      = np.linspace(0.0, equil_duration, len(equil_states))
-    sched_states = np.concatenate([np.array(tr) for tr in schedule_trajs], axis=0)
-    t_sched      = np.linspace(equil_duration,
-                               equil_duration + len(pH_schedule) * duration_per_seg,
-                               len(sched_states))
-    all_st  = np.concatenate([equil_states, sched_states], axis=0)
-    t_all   = np.concatenate([t_equil, t_sched])
+    equil_states   = np.array(equil_traj)
+    t_equil        = np.linspace(0.0, equil_duration, len(equil_states))
+    sched_states   = np.concatenate([np.array(tr) for tr in schedule_trajs], axis=0)
+    _sched_end     = equil_duration + len(pH_schedule) * duration_per_seg
+    t_sched        = np.linspace(equil_duration, _sched_end, len(sched_states))
+    _post_dur_plot = float(post_duration)
+    if post_traj is not None and _post_dur_plot > 0:
+        post_states = np.array(post_traj)
+        t_post  = np.linspace(_sched_end, _sched_end + _post_dur_plot, len(post_states))
+        all_st  = np.concatenate([equil_states, sched_states, post_states], axis=0)
+        t_all   = np.concatenate([t_equil, t_sched, t_post])
+    else:
+        all_st  = np.concatenate([equil_states, sched_states], axis=0)
+        t_all   = np.concatenate([t_equil, t_sched])
     n_triu  = len(i_idx)
 
     # Symlog scale: linear below 1e-3, log above
@@ -589,7 +597,11 @@ def plot_summary(loss_history, score_history, param_history,
         t0 = equil_duration + s_i * duration_per_seg
         t1 = equil_duration + (s_i + 1) * duration_per_seg
         ax_conc.axvspan(t0, t1, alpha=0.07, color=seg_colors[s_i % len(seg_colors)])
+    if _post_dur_plot > 0:
+        ax_conc.axvspan(_sched_end, _sched_end + _post_dur_plot, alpha=0.06, color='#7f8c8d')
     ax_conc.axvline(equil_duration, color='grey', linewidth=1.0, linestyle=':', alpha=0.6)
+    if _post_dur_plot > 0:
+        ax_conc.axvline(_sched_end, color='grey', linewidth=1.0, linestyle=':', alpha=0.6)
 
     # --- Boltzmann thermodynamic equilibrium reference lines ----------------
     # For each pH segment (including equilibration at pH 7), solve the
@@ -608,6 +620,8 @@ def plot_summary(loss_history, score_history, param_history,
          equil_duration + si * duration_per_seg,
          equil_duration + (si + 1) * duration_per_seg)
         for si in range(len(pH_schedule))]
+    if _post_dur_plot > 0:
+        ph_segs = ph_segs + [(7.0, _sched_end, _sched_end + _post_dur_plot)]
 
     _eq_legend_done = False
     for ph_val, ts0, ts1 in ph_segs:
@@ -638,7 +652,10 @@ def plot_summary(loss_history, score_history, param_history,
 
     ax_conc.set_xlabel('Time', fontsize=11)
     ax_conc.set_ylabel('Concentration (symlog)', fontsize=11)
-    ax_conc.set_title(f'Concentrations — target schedule {pH_schedule}', fontsize=12)
+    _conc_title = f'Concentrations — target schedule {pH_schedule}'
+    if _post_dur_plot > 0:
+        _conc_title += f' + pH 7 post ({_post_dur_plot:.0f} t)'
+    ax_conc.set_title(_conc_title, fontsize=12)
     ax_conc.legend(fontsize=6.5, loc='upper right', ncol=3,
                    bbox_to_anchor=(1.0, 1.0), framealpha=0.85)
     ax_conc.grid(alpha=0.2, which='both')
@@ -647,6 +664,9 @@ def plot_summary(loss_history, score_history, param_history,
     ax_pH = ax_conc.twinx()
     ph_values = _ph_trace(t_all, equil_duration, pH_schedule,
                           duration_per_seg, sw)
+    # Override post-duration portion: pH returns to 7
+    if _post_dur_plot > 0:
+        ph_values[t_all > _sched_end] = 7.0
     ax_pH.plot(t_all, ph_values, color='#8e44ad', linewidth=2.5, alpha=0.8,
                linestyle='-', label='pH(t)', zorder=20)
     ax_pH.set_ylabel('pH', color='#8e44ad', fontsize=11)
@@ -662,6 +682,9 @@ def plot_summary(loss_history, score_history, param_history,
         t1 = equil_duration + (s_i + 1) * duration_per_seg
         ax_pH.text((t0 + t1) / 2, hi - 0.1, f'pH {pH_v:.0f}',
                    ha='center', va='top', fontsize=8, color='#8e44ad')
+    if _post_dur_plot > 0:
+        ax_pH.text((_sched_end + _sched_end + _post_dur_plot) / 2, hi - 0.1,
+                   'pH 7 (post)', ha='center', va='top', fontsize=8, color='#8e44ad')
 
     # -------------------------------------------------------------------
     # Panel 5 — ΔG vs pH (correct bonds + competitor ensembles)

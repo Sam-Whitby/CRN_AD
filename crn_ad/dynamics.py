@@ -157,7 +157,8 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                            ph_initial=None,
                            allowed_mask=None,
                            beta_ramp_duration=0.0,
-                           no_self_bonds=False):
+                           no_self_bonds=False,
+                           return_traj=False):
     """
     Scan-based simulation — O(1) JAX graph via lax.scan + vmap.
 
@@ -165,8 +166,11 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
     ph_initial         : pH before this schedule (for smooth ramp on first seg).
     allowed_mask       : if not None, pairs outside this mask have ΔG=0.
     beta_ramp_duration : if > 0, beta ramps linearly 0→beta over this many
-                         time units at the start of the segment (used for the
-                         equilibration segment to avoid stiff transients).
+                         time units at the start of the segment.
+    return_traj        : if True, also return stacked segment trajectories as a
+                         (n_segs, n_points, state_size) array alongside the
+                         final state.  When False (default), returns only the
+                         final state (cheaper: uses SaveAt(t1=True)).
     """
     t0    = 0.0
     t1    = float(duration_per_seg)
@@ -177,8 +181,6 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
         w   = float(smooth_width)
         ph0 = pH_schedule_array[0] if ph_initial is None else jnp.array(float(ph_initial))
 
-        # Build the vector field once, with the beta-ramp decision baked in at
-        # Python (trace) time so no dead-branch gradient blowup occurs.
         if _ramp > 0.0:
             def vf(t, s, ph_args):
                 _pH_prev, _pH_target = ph_args
@@ -197,26 +199,37 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                                correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds)
 
-        def segment_fn(carry, pH_target):
-            state, pH_prev = carry
-            sol = diffrax.diffeqsolve(
-                diffrax.ODETerm(vf),
-                diffrax.Tsit5(),
-                t0=t0, t1=t1, dt0=dt0,
-                y0=state,
-                args=(pH_prev, pH_target),
-                saveat=diffrax.SaveAt(t1=True),
-                stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
-                max_steps=4096,
-                adjoint=diffrax.RecursiveCheckpointAdjoint(),
-            )
-            return (jnp.maximum(sol.ys[0], 0.0), pH_target), None
+        if return_traj:
+            def segment_fn(carry, pH_target):
+                state, pH_prev = carry
+                sol = diffrax.diffeqsolve(
+                    diffrax.ODETerm(vf), diffrax.Tsit5(),
+                    t0=t0, t1=t1, dt0=dt0, y0=state,
+                    args=(pH_prev, pH_target),
+                    saveat=diffrax.SaveAt(ts=jnp.linspace(t0, t1, n_points)),
+                    stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
+                    max_steps=4096, adjoint=diffrax.RecursiveCheckpointAdjoint(),
+                )
+                traj  = sol.ys                        # (n_points, state_size)
+                final = jnp.maximum(traj[-1], 0.0)
+                return (final, pH_target), traj
+        else:
+            def segment_fn(carry, pH_target):
+                state, pH_prev = carry
+                sol = diffrax.diffeqsolve(
+                    diffrax.ODETerm(vf), diffrax.Tsit5(),
+                    t0=t0, t1=t1, dt0=dt0, y0=state,
+                    args=(pH_prev, pH_target),
+                    saveat=diffrax.SaveAt(t1=True),
+                    stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
+                    max_steps=4096, adjoint=diffrax.RecursiveCheckpointAdjoint(),
+                )
+                return (jnp.maximum(sol.ys[0], 0.0), pH_target), None
 
-        (final_state, _), _ = jax.lax.scan(segment_fn,
-                                            (initial_state, ph0),
-                                            pH_schedule_array)
+        (final_state, _), trajs = jax.lax.scan(
+            segment_fn, (initial_state, ph0), pH_schedule_array)
+
     else:
-        # Build with beta-ramp decision baked in at Python (trace) time.
         if _ramp > 0.0:
             def vf(t, s, pH):
                 beta_t = jnp.where(t < _ramp, float(beta) * t / _ramp, float(beta))
@@ -229,20 +242,34 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                                correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds)
 
-        def segment_fn(state, pH):
-            sol = diffrax.diffeqsolve(
-                diffrax.ODETerm(vf),
-                diffrax.Tsit5(),
-                t0=t0, t1=t1, dt0=dt0,
-                y0=state,
-                args=pH,
-                saveat=diffrax.SaveAt(t1=True),
-                stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
-                max_steps=4096,
-                adjoint=diffrax.RecursiveCheckpointAdjoint(),
-            )
-            return jnp.maximum(sol.ys[0], 0.0), None
+        if return_traj:
+            def segment_fn(state, pH):
+                sol = diffrax.diffeqsolve(
+                    diffrax.ODETerm(vf), diffrax.Tsit5(),
+                    t0=t0, t1=t1, dt0=dt0, y0=state,
+                    args=pH,
+                    saveat=diffrax.SaveAt(ts=jnp.linspace(t0, t1, n_points)),
+                    stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
+                    max_steps=4096, adjoint=diffrax.RecursiveCheckpointAdjoint(),
+                )
+                traj  = sol.ys                       # (n_points, state_size)
+                final = jnp.maximum(traj[-1], 0.0)
+                return final, traj
+        else:
+            def segment_fn(state, pH):
+                sol = diffrax.diffeqsolve(
+                    diffrax.ODETerm(vf), diffrax.Tsit5(),
+                    t0=t0, t1=t1, dt0=dt0, y0=state,
+                    args=pH,
+                    saveat=diffrax.SaveAt(t1=True),
+                    stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
+                    max_steps=4096, adjoint=diffrax.RecursiveCheckpointAdjoint(),
+                )
+                return jnp.maximum(sol.ys[0], 0.0), None
 
-        final_state, _ = jax.lax.scan(segment_fn, initial_state, pH_schedule_array)
+        final_state, trajs = jax.lax.scan(
+            segment_fn, initial_state, pH_schedule_array)
 
+    if return_traj:
+        return final_state, trajs   # trajs: (n_segs, n_points, state_size)
     return final_state
