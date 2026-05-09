@@ -202,17 +202,17 @@ def build_parser():
                    choices=['adam', 'hybrid'],
                    help='Optimisation algorithm.  '
                         'adam (default): Adam with --n_restarts independent runs.  '
-                        'hybrid: single run of CMA-ES (global basin search) followed '
-                        'by L-BFGS-B (gradient-based polish).  Requires evosax and '
-                        'jaxopt.  Ignores --n_restarts; use --cmaes_epochs / '
-                        '--lbfgs_epochs to control budget instead.')
-    p.add_argument('--cmaes_epochs', type=int, default=200,
-                   help='Number of CMA-ES generations for --optimizer hybrid.  '
-                        'Each generation evaluates popsize ≈ 4+3·ln(n_params) '
-                        'candidates in parallel via vmap.  Default 200.')
+                        'hybrid: multi-start L-BFGS-B in physical parameter space '
+                        'with Sobol quasi-random initialisation, followed by a final '
+                        'L-BFGS-B polish.  Ignores --n_restarts; use --cmaes_epochs '
+                        'for number of restarts and --lbfgs_epochs for iterations '
+                        'per restart.')
+    p.add_argument('--cmaes_epochs', type=int, default=10,
+                   help='Number of independent L-BFGS-B restarts for --optimizer hybrid.  '
+                        'Each restart starts from a distinct Sobol point.  Default 10.')
     p.add_argument('--lbfgs_epochs', type=int, default=100,
-                   help='Maximum L-BFGS-B iterations for --optimizer hybrid.  '
-                        'Applied as a gradient-based polish after CMA-ES.  Default 100.')
+                   help='Maximum L-BFGS-B iterations per restart for --optimizer hybrid.  '
+                        'Final polish uses max(lbfgs_epochs, 200) iterations.  Default 100.')
     # ---- Eval mode: specify all parameters explicitly ----
     p.add_argument('--eval_pKa', nargs='+', type=float, default=None,
                    help='(--mode eval) pKa values, one per species.')

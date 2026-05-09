@@ -883,30 +883,26 @@ def _snapshot(p, S_max):
 
 def train_cmaes_hybrid(config):
     """
-    Two-stage hybrid optimiser: CMA-ES (global basin finding) then L-BFGS-B.
+    Multi-start L-BFGS-B optimizer in physical parameter space.
 
-    Stage 1 — CMA-ES (evosax):
-        Maintains a multivariate Gaussian over raw (unconstrained) parameter
-        space.  Evaluates a population of size λ each generation via vmap.
-        Self-adapts step size σ and covariance matrix C — no learning-rate
-        tuning required.  Default λ = max(20, 4+3·ln(n)) for n parameters.
+    Stage 1 — Multi-start L-BFGS-B (scipy):
+        Runs ``cmaes_epochs`` independent L-BFGS-B runs from Sobol
+        quasi-random starting points in physical parameter space
+        (pKa ∈ [3,10], φ ∈ [0,1], J ∈ [0.5,J_max]).  Box constraints
+        are enforced by scipy; JAX autodiff provides exact gradients.
+        Gradients near boundaries are amplified via the logit chain rule,
+        pushing runs away from degenerate φ≈0 solutions.
 
-    Stage 2 — L-BFGS-B (jaxopt):
-        Starts from the CMA-ES best solution; uses JAX autodiff for fast
-        superlinear convergence to a high-quality local minimum.
+    Stage 2 — Final L-BFGS-B polish:
+        Starting from the Stage 1 best, runs longer with tighter
+        ftol/gtol for high-precision convergence.
 
     Returns the same 10-tuple as train() for drop-in compatibility.
-    Score_history and param_history are returned empty (use --mode eval for
-    detailed per-step analysis of the final parameters).
+    Score_history is empty; param_history has one snapshot per restart
+    plus a final entry (compatible with plot_summary).
     """
-    try:
-        from evosax import CMA_ES as _CMA_ES
-    except ImportError as exc:
-        raise ImportError(
-            "evosax is required for --optimizer hybrid.  "
-            "Install with:  pip install 'evosax>=0.1.6'"
-        ) from exc
     import scipy.optimize as _scipy_opt
+    from scipy.stats.qmc import Sobol as _Sobol
 
     # ------------------------------------------------------------------
     # Setup (mirrors train() lines 502–692; kept in sync manually)
@@ -1057,162 +1053,170 @@ def train_cmaes_hybrid(config):
         return loss_val
 
     # ------------------------------------------------------------------
-    # Flatten initial params for evosax (needs a 1D array)
+    # Physical-space loss and bounds
+    # Working in constrained space [pKa∈[3,10], φ∈[0,1], J∈[0.5,J_max]]
+    # avoids the logit-space distortion that causes CMA-ES to collapse to
+    # degenerate boundary solutions.  Gradients near boundaries are
+    # amplified via the logit chain rule (inside unconstrain_params),
+    # pushing L-BFGS-B away from φ≈0 / boundary-pKa solutions.
     # ------------------------------------------------------------------
-    flat0, treedef, shapes, sizes = _flatten_params(raw_params_init)
-    n_dims = int(flat0.shape[0])
+    _n_pka = 2 * N_acids
+    _n_ent = n_entropy if S_max > 0.0 else 0
+    n_phys = _n_pka + 2 + _n_ent
+
+    _lo_arr = np.concatenate([
+        [3.01] * _n_pka,
+        [0.001, 0.51],
+        ([0.001 * S_max] * _n_ent if _n_ent > 0 else []),
+    ])
+    _hi_arr = np.concatenate([
+        [9.99] * _n_pka,
+        [0.999, J_max - 0.01],
+        ([0.999 * S_max] * _n_ent if _n_ent > 0 else []),
+    ])
+    scipy_bounds = list(zip(_lo_arr.tolist(), _hi_arr.tolist()))
+
+    @jax.jit
+    def _phys_to_loss(phys_flat):
+        phys = {
+            'pKa': phys_flat[:_n_pka],
+            'phi': phys_flat[_n_pka],
+            'J':   phys_flat[_n_pka + 1],
+        }
+        if S_max > 0.0:
+            phys['monomer_entropy'] = phys_flat[_n_pka + 2:]
+        raw = unconstrain_params(phys, J_max=J_max, S_max=S_max)
+        loss_val, _ = loss_fn(raw)
+        return loss_val
+
+    _phys_val_and_grad = jax.jit(jax.value_and_grad(_phys_to_loss))
+
+    # Build initial physical flat vector for warm-up compile
+    _init_phys_list = (list(np.array(init_phys_np['pKa']))
+                       + [float(init_phys_np['phi']), float(init_phys_np['J'])])
+    if S_max > 0.0:
+        _init_phys_list += list(np.array(init_phys_np.get('monomer_entropy', [])))
+    _init_phys_flat = np.array(_init_phys_list, dtype=np.float64)
 
     if verbose:
-        print(f"CMA-ES + L-BFGS-B hybrid  |  n_params={n_dims}  "
+        print(f"Multi-start L-BFGS-B  |  n_params={n_phys}  "
               f"target={target_sched}  J_max={J_max}", flush=True)
+        print("  Compiling physical-space value+grad ...", flush=True)
+    _ = _phys_val_and_grad(jnp.array(_init_phys_flat))
+    if verbose:
+        print("  Compilation done.\n", flush=True)
+
+    def _scipy_phys_fg(x_np):
+        lv, gv = _phys_val_and_grad(jnp.array(x_np, dtype=float))
+        return float(lv), np.array(gv, dtype=np.float64)
 
     # ------------------------------------------------------------------
-    # Stage 1: CMA-ES
+    # Stage 1: Multi-start L-BFGS-B with Sobol quasi-random initialisation
+    # cmaes_epochs is repurposed as the number of independent restarts.
     # ------------------------------------------------------------------
-    cmaes_epochs = int(config.get('cmaes_epochs', 200))
-    popsize      = max(20, 4 + int(3 * float(jnp.log(float(n_dims)))))
+    n_restarts    = int(config.get('cmaes_epochs', 10))
+    lbfgs_maxiter = int(config.get('lbfgs_epochs', 100))
 
-    strategy  = _CMA_ES(popsize=popsize, num_dims=n_dims)
-    es_params = strategy.default_params
-    rng_jax   = jax.random.PRNGKey(int(config.get('seed', 42)))
-    es_state  = strategy.initialize(rng_jax, es_params)
-    # Seed the distribution mean at the random initialisation point.
-    # evosax uses float32 internally; cast explicitly to avoid dtype errors.
-    es_state  = es_state.replace(mean=flat0.astype(jnp.float32))
-
-    # vmap loss over the population; compiled once, reused every generation.
-    # Cast to float32: evosax CMA-ES state uses float32 and lax.select requires
-    # matching dtypes between fitness and the stored best_fitness.
-    def _eval_population(flat_pop):
-        def _single(flat):
-            rp = _unflatten_params(flat, treedef, shapes, sizes)
-            return scalar_loss_fn(rp).astype(jnp.float32)
-        return jax.vmap(_single)(flat_pop)
-
-    eval_pop_jit = jax.jit(_eval_population)
+    sampler    = _Sobol(d=n_phys, scramble=True,
+                        seed=int(config.get('seed', 42)))
+    sobol_unit = sampler.random(n=n_restarts)              # (n_restarts, n_phys) ∈ [0,1]
+    sobol_phys = _lo_arr + sobol_unit * (_hi_arr - _lo_arr)  # scaled to physical bounds
 
     if verbose:
         n_scheds = len(all_schedules)
-        print(f"Stage 1 — CMA-ES  |  popsize={popsize}  generations={cmaes_epochs}  "
-              f"n_schedules={n_scheds}", flush=True)
-        print("  Compiling vmapped population evaluation ...", flush=True)
+        print(f"Stage 1 — {n_restarts} L-BFGS-B restarts  |  "
+              f"maxiter={lbfgs_maxiter}  n_schedules={n_scheds}", flush=True)
 
-    # Warm-up compile (generation 0)
-    rng_jax, rng_ask = jax.random.split(rng_jax)
-    flat_pop, es_state = strategy.ask(rng_ask, es_state, es_params)
-    fitness    = eval_pop_jit(flat_pop)
-    es_state   = strategy.tell(flat_pop, fitness, es_state, es_params)
+    best_loss      = float('inf')
+    best_phys_flat = _init_phys_flat.copy()
+    loss_history   = []
+    param_history  = []
 
-    best_idx  = int(jnp.argmin(fitness))
-    best_loss = float(fitness[best_idx])
-    best_flat = flat_pop[best_idx]
-    loss_history = [best_loss]
+    def _phys_flat_to_snapshot(pf):
+        phys_d = {
+            'pKa': jnp.array(pf[:_n_pka]),
+            'phi': jnp.array(float(pf[_n_pka])),
+            'J':   jnp.array(float(pf[_n_pka + 1])),
+        }
+        if S_max > 0.0:
+            phys_d['monomer_entropy'] = jnp.array(pf[_n_pka + 2:])
+        raw_d  = unconstrain_params(phys_d, J_max=J_max, S_max=S_max)
+        phys_c = constrain_params(raw_d, J_max=J_max, S_max=S_max,
+                                  fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
+                                  fixed_pKa=fixed_pKa_val)
+        return _snapshot(phys_c, S_max)
 
-    if verbose:
-        print(f"  Compilation done.  Gen   0/{cmaes_epochs}  "
-              f"best={best_loss:.4f}  mean={float(jnp.mean(fitness)):.4f}",
-              flush=True)
+    for restart_i in range(n_restarts):
+        x0  = sobol_phys[restart_i]
+        res = _scipy_opt.minimize(
+            _scipy_phys_fg, x0=x0,
+            method='L-BFGS-B', jac=True, bounds=scipy_bounds,
+            options={'maxiter': lbfgs_maxiter, 'disp': False,
+                     'ftol': 1e-9, 'gtol': 1e-6},
+        )
+        r_loss = float(res.fun) if np.isfinite(res.fun) else float('inf')
 
-    print_every = max(1, cmaes_epochs // 10)
+        if r_loss < best_loss:
+            best_loss      = r_loss
+            best_phys_flat = np.array(res.x, dtype=np.float64)
 
-    for gen in range(1, cmaes_epochs):
-        rng_jax, rng_ask = jax.random.split(rng_jax)
-        flat_pop, es_state = strategy.ask(rng_ask, es_state, es_params)
-        fitness    = eval_pop_jit(flat_pop)
-        es_state   = strategy.tell(flat_pop, fitness, es_state, es_params)
-
-        gen_best_idx  = int(jnp.argmin(fitness))
-        gen_best_loss = float(fitness[gen_best_idx])
-        if gen_best_loss < best_loss:
-            best_loss = gen_best_loss
-            best_flat = flat_pop[gen_best_idx]
         loss_history.append(best_loss)
+        param_history.append(_phys_flat_to_snapshot(best_phys_flat))
 
-        if verbose and (gen % print_every == 0 or gen == cmaes_epochs - 1):
-            print(f"  Gen {gen:4d}/{cmaes_epochs}  "
-                  f"best={best_loss:.4f}  "
-                  f"gen_best={gen_best_loss:.4f}  "
-                  f"pop_mean={float(jnp.mean(fitness)):.4f}",
-                  flush=True)
-
-    if verbose:
-        print(f"Stage 1 complete.  CMA-ES best loss: {best_loss:.4f}\n", flush=True)
-
-    # ------------------------------------------------------------------
-    # Stage 2: L-BFGS-B via scipy + JAX gradients
-    #
-    # Using scipy.optimize.minimize rather than jaxopt.LBFGS avoids
-    # compiling the entire optimisation loop as a JAX while_loop (which
-    # takes several minutes for ODE-differentiated losses).  Instead, a
-    # single value+grad function is compiled once (~seconds), then scipy
-    # drives the L-BFGS-B iteration in Python, calling the compiled JAX
-    # function each step.
-    # ------------------------------------------------------------------
-    lbfgs_epochs = int(config.get('lbfgs_epochs', 100))
-    best_raw     = _unflatten_params(best_flat, treedef, shapes, sizes)
-
-    if verbose:
-        print(f"Stage 2 — L-BFGS-B (scipy)  |  maxiter={lbfgs_epochs}  "
-              f"history_size=10", flush=True)
-        print("  Compiling value+grad function ...", flush=True)
-
-    # Compile a flat-array value+grad function once.
-    @jax.jit
-    def _val_and_flat_grad(x_flat):
-        rp = _unflatten_params(x_flat, treedef, shapes, sizes)
-        loss_val, grad_dict = jax.value_and_grad(scalar_loss_fn)(rp)
-        grad_flat = jnp.concatenate([
-            jnp.atleast_1d(jnp.asarray(l))
-            for l in jax.tree_util.tree_leaves(grad_dict)
-        ])
-        return loss_val, grad_flat
-
-    # Warm-up compile with the CMA-ES solution.
-    _ = _val_and_flat_grad(best_flat)
-    if verbose:
-        print("  Compilation done.", flush=True)
-
-    _param_dtype = best_flat.dtype
-
-    def _scipy_fg(x_np):
-        lv, gv = _val_and_flat_grad(jnp.array(x_np, dtype=_param_dtype))
-        return float(lv), np.array(gv, dtype=np.float64)
-
-    scipy_result = _scipy_opt.minimize(
-        _scipy_fg,
-        x0=np.array(best_flat, dtype=np.float64),
-        method='L-BFGS-B',
-        jac=True,
-        options={'maxiter': lbfgs_epochs, 'disp': False, 'ftol': 1e-9, 'gtol': 1e-6},
-    )
-    raw_params = _unflatten_params(
-        jnp.array(scipy_result.x, dtype=_param_dtype), treedef, shapes, sizes
-    )
-    final_loss = float(scipy_result.fun)
-
-    # Guard: if L-BFGS diverged or made things worse, keep CMA-ES solution.
-    if not np.isfinite(final_loss) or final_loss > best_loss:
         if verbose:
-            print(f"  L-BFGS-B did not improve (loss {final_loss:.4f} vs "
-                  f"CMA-ES {best_loss:.4f}); keeping CMA-ES solution.",
-                  flush=True)
-        raw_params = best_raw
-        final_loss = best_loss
-    loss_history.append(final_loss)
+            print(f"  Restart {restart_i + 1:3d}/{n_restarts}  "
+                  f"this={r_loss:.4f}  best={best_loss:.4f}", flush=True)
 
     if verbose:
-        p_lbfgs  = constrain_params(raw_params, J_max=J_max, S_max=S_max,
-                                    fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
-                                    fixed_pKa=fixed_pKa_val)
-        pKa_arr  = [float(v) for v in p_lbfgs['pKa']]
+        print(f"\nStage 1 complete.  Best loss: {best_loss:.4f}\n", flush=True)
+
+    # ------------------------------------------------------------------
+    # Stage 2: Final polish from Stage 1 best (tighter tolerances)
+    # ------------------------------------------------------------------
+    polish_maxiter = max(lbfgs_maxiter, 200)
+    if verbose:
+        print(f"Stage 2 — Final polish  |  maxiter={polish_maxiter}", flush=True)
+
+    res2        = _scipy_opt.minimize(
+        _scipy_phys_fg, x0=best_phys_flat,
+        method='L-BFGS-B', jac=True, bounds=scipy_bounds,
+        options={'maxiter': polish_maxiter, 'disp': False,
+                 'ftol': 1e-12, 'gtol': 1e-8},
+    )
+    polish_loss = float(res2.fun) if np.isfinite(res2.fun) else float('inf')
+
+    if polish_loss < best_loss:
+        best_phys_flat = np.array(res2.x, dtype=np.float64)
+        best_loss      = polish_loss
+    elif verbose:
+        print(f"  Polish did not improve ({polish_loss:.4f} vs "
+              f"{best_loss:.4f}); keeping Stage 1 best.", flush=True)
+
+    loss_history.append(best_loss)
+    param_history.append(_phys_flat_to_snapshot(best_phys_flat))
+
+    # Convert best physical params → raw params for equil + return
+    best_phys_d = {
+        'pKa': jnp.array(best_phys_flat[:_n_pka]),
+        'phi': jnp.array(float(best_phys_flat[_n_pka])),
+        'J':   jnp.array(float(best_phys_flat[_n_pka + 1])),
+    }
+    if S_max > 0.0:
+        best_phys_d['monomer_entropy'] = jnp.array(best_phys_flat[_n_pka + 2:])
+    raw_params = unconstrain_params(best_phys_d, J_max=J_max, S_max=S_max)
+
+    if verbose:
+        p_final_v = constrain_params(raw_params, J_max=J_max, S_max=S_max,
+                                     fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
+                                     fixed_pKa=fixed_pKa_val)
+        pKa_arr  = [float(v) for v in p_final_v['pKa']]
         acid_str = ' '.join(f'{v:.2f}' for v in pKa_arr[:N_acids])
         base_str = ' '.join(f'{v:.2f}' for v in pKa_arr[N_acids:])
-        phi_str  = f'{float(p_lbfgs["phi"]):.3f}'
-        J_str    = f'{float(p_lbfgs["J"]):.3f}'
-        print(f"Stage 2 complete.  Final loss: {final_loss:.4f}")
+        print(f"Stage 2 complete.  Final loss: {best_loss:.4f}")
         print(f"  pKa acids=[{acid_str}]")
         print(f"  pKa bases=[{base_str}]")
-        print(f"  φ={phi_str}  J={J_str}\n", flush=True)
+        print(f"  φ={float(p_final_v['phi']):.3f}  J={float(p_final_v['J']):.3f}\n",
+              flush=True)
 
     # ------------------------------------------------------------------
     # Compute equilibrium state for visualisation (same as end of train())
@@ -1245,6 +1249,6 @@ def train_cmaes_hybrid(config):
             no_self_bonds=no_self_bonds,
         )
 
-    return (raw_params, loss_history, [], [],
+    return (raw_params, loss_history, [], param_history,
             static, all_schedules, target_idx, equil_state,
             init_phys_np, False)

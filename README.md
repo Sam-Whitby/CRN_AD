@@ -116,7 +116,7 @@ pip install -r requirements.txt
 
 Requires: `jax[cpu]`, `diffrax`, `optax`, `numpy`, `matplotlib`. Use `jax[cuda]` for GPU. `pandas` is optional (used for CSV export).
 
-For the CMA-ES hybrid optimiser (`--optimizer hybrid`): `evosax>=0.1.6` (included in `requirements.txt`).
+For the hybrid optimiser (`--optimizer hybrid`): `evosax>=0.1.6` is listed in `requirements.txt` (retained for optional use).
 
 ---
 
@@ -157,22 +157,24 @@ python main.py --start_equil --N 4 --M 2 --n_epochs 300
 python main.py --n_restarts 8 --wide_init --n_epochs 400 --J_init_max
 ```
 
-### CMA-ES + L-BFGS-B hybrid optimizer
+### Multi-start L-BFGS-B hybrid optimizer
 
-With 16 Adam restarts, roughly 70 % of runs converge to a poor local minimum (loss ~1.9) rather than finding a good solution (loss <1.5). The hybrid optimizer replaces all restarts with a single two-stage run that covers the loss landscape systematically:
+With 16 Adam restarts, roughly 70 % of individual runs converge to a poor local minimum (loss ~1.9). The hybrid optimizer takes a different approach: it runs multiple independent L-BFGS-B runs from quasi-random starting points in **physical parameter space**, then applies a final high-precision polish:
 
-- **Stage 1 — CMA-ES**: maintains a Gaussian distribution over parameter space and evaluates a population of ~20–30 candidates per generation via `vmap`. No learning-rate tuning: step size and covariance are self-adapted.
-- **Stage 2 — L-BFGS-B**: starts from the CMA-ES best solution and converges to a high-quality minimum using JAX-computed gradients (compiled once via `jax.jit`, iterated by scipy's L-BFGS-B).
+- **Stage 1 — Multi-start L-BFGS-B**: `--cmaes_epochs` independent L-BFGS-B runs (default 10), each starting from a distinct Sobol quasi-random point in physical parameter space (pKa ∈ [3, 10], φ ∈ [0, 1], J ∈ [0.5, J_max]). Box constraints are enforced by scipy. JAX autodiff provides exact gradients via a single compiled value+grad function (~5–30 s one-time compilation).
+- **Stage 2 — Final polish**: starts from the Stage 1 best and runs a longer L-BFGS-B pass with tighter tolerances.
+
+Working in physical (constrained) space avoids the logit-space distortion that can cause gradient-free methods to collapse to degenerate boundary solutions. Gradients near parameter boundaries are amplified via the chain rule through `unconstrain_params`, actively pushing optimisation away from φ ≈ 0 or extreme-pKa solutions.
 
 ```bash
 python main.py \
   --N 10 --M 1 --target_pH 5 9 7 \
-  --duration 30 --J_max 20 --J_init_max --start_equil \
-  --optimizer hybrid --cmaes_epochs 200 --lbfgs_epochs 100 \
-  --outdir my_outputs --seed 50 --post_duration 100
+  --duration 30 --J_max 20 --start_equil \
+  --optimizer hybrid --cmaes_epochs 16 --lbfgs_epochs 120 \
+  --outdir my_outputs --seed 42 --post_duration 100
 ```
 
-**Expected behaviour on first run**: JAX compiles the vmapped CMA-ES fitness function and the gradient function on the first call (~1–3 min one-time cost). Subsequent runs in the same session reuse the cached XLA and are fast. Progress is printed every `cmaes_epochs // 10` generations.
+**Expected behaviour**: one-time JAX compilation ~5–30 s, then ~2–5 s per restart for N=10. With 16 restarts, at least one typically reaches loss ≤ 1.37 (competitive with or better than Adam's best across 16 restarts). Use `--cmaes_epochs 32` for more reliable coverage of the loss landscape.
 
 The Adam multi-restart path (`--optimizer adam`, the default) is unchanged.
 
@@ -281,9 +283,9 @@ python main.py --J_max 10.0 --smooth_width 2.0 --J_init_max
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--optimizer` | `adam` | `adam`: Adam with `--n_restarts` independent restarts. `hybrid`: single CMA-ES + L-BFGS-B run (requires `evosax`; ignores `--n_restarts`). |
-| `--cmaes_epochs` | `200` | CMA-ES generations for `--optimizer hybrid`. Each generation evaluates `popsize ≈ 4+3·ln(n_params)` candidates in parallel. |
-| `--lbfgs_epochs` | `100` | Max L-BFGS-B iterations for `--optimizer hybrid` (gradient-based polish after CMA-ES). |
+| `--optimizer` | `adam` | `adam`: Adam with `--n_restarts` independent restarts. `hybrid`: multi-start L-BFGS-B in physical parameter space followed by a final polish (ignores `--n_restarts`). |
+| `--cmaes_epochs` | `10` | Number of independent L-BFGS-B restarts for `--optimizer hybrid`. Each starts from a distinct Sobol quasi-random point. |
+| `--lbfgs_epochs` | `100` | Max L-BFGS-B iterations per restart for `--optimizer hybrid`. Final polish uses `max(lbfgs_epochs, 200)`. |
 | `--tau` | `6.0` | Softmax temperature in InfoNCE loss. |
 | `--weight_decay` | `0.0` | AdamW L2 weight decay on raw parameters (Adam only). |
 | `--grad_clip VALUE` | off | Clip gradient norm through each ODE call (Adam only). |
