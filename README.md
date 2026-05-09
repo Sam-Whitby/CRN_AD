@@ -116,6 +116,8 @@ pip install -r requirements.txt
 
 Requires: `jax[cpu]`, `diffrax`, `optax`, `numpy`, `matplotlib`. Use `jax[cuda]` for GPU. `pandas` is optional (used for CSV export).
 
+For the CMA-ES hybrid optimiser (`--optimizer hybrid`): `evosax>=0.1.6` (included in `requirements.txt`).
+
 ---
 
 ## Usage
@@ -148,12 +150,31 @@ python main.py --N 8 --M 2 --target_pH 9 5 7
 python main.py --start_equil --N 4 --M 2 --n_epochs 300
 ```
 
-### Multiple restarts
+### Multiple restarts (Adam)
 
 ```bash
 # 8 restarts, wide uniform init; best seed is shown in the summary plot
 python main.py --n_restarts 8 --wide_init --n_epochs 400 --J_init_max
 ```
+
+### CMA-ES + L-BFGS-B hybrid optimizer
+
+With 16 Adam restarts, roughly 70 % of runs converge to a poor local minimum (loss ~1.9) rather than finding a good solution (loss <1.5). The hybrid optimizer replaces all restarts with a single two-stage run that covers the loss landscape systematically:
+
+- **Stage 1 — CMA-ES**: maintains a Gaussian distribution over parameter space and evaluates a population of ~20–30 candidates per generation via `vmap`. No learning-rate tuning: step size and covariance are self-adapted.
+- **Stage 2 — L-BFGS-B**: starts from the CMA-ES best solution and converges to a high-quality minimum using JAX-computed gradients (compiled once via `jax.jit`, iterated by scipy's L-BFGS-B).
+
+```bash
+python main.py \
+  --N 10 --M 1 --target_pH 5 9 7 \
+  --duration 30 --J_max 20 --J_init_max --start_equil \
+  --optimizer hybrid --cmaes_epochs 200 --lbfgs_epochs 100 \
+  --outdir my_outputs --seed 50 --post_duration 100
+```
+
+**Expected behaviour on first run**: JAX compiles the vmapped CMA-ES fitness function and the gradient function on the first call (~1–3 min one-time cost). Subsequent runs in the same session reuse the cached XLA and are fast. Progress is printed every `cmaes_epochs // 10` generations.
+
+The Adam multi-restart path (`--optimizer adam`, the default) is unchanged.
 
 ### Export time traces to CSV
 
@@ -260,9 +281,12 @@ python main.py --J_max 10.0 --smooth_width 2.0 --J_init_max
 
 | Argument | Default | Description |
 |----------|---------|-------------|
+| `--optimizer` | `adam` | `adam`: Adam with `--n_restarts` independent restarts. `hybrid`: single CMA-ES + L-BFGS-B run (requires `evosax`; ignores `--n_restarts`). |
+| `--cmaes_epochs` | `200` | CMA-ES generations for `--optimizer hybrid`. Each generation evaluates `popsize ≈ 4+3·ln(n_params)` candidates in parallel. |
+| `--lbfgs_epochs` | `100` | Max L-BFGS-B iterations for `--optimizer hybrid` (gradient-based polish after CMA-ES). |
 | `--tau` | `6.0` | Softmax temperature in InfoNCE loss. |
-| `--weight_decay` | `0.0` | AdamW L2 weight decay on raw parameters. |
-| `--grad_clip VALUE` | off | Clip gradient norm through each ODE call. |
+| `--weight_decay` | `0.0` | AdamW L2 weight decay on raw parameters (Adam only). |
+| `--grad_clip VALUE` | off | Clip gradient norm through each ODE call (Adam only). |
 | `--no_baseline` | off | Exclude pH-7 baseline from loss. |
 | `--post_duration` | `0.0` | After each pH schedule, return to pH 7 and simulate for this many time units. Scores are computed as the duration-weighted time-averaged correct-dimer concentration over (schedule + post) phases. Setting to 0 (default) uses the original final-state score. |
 
@@ -305,7 +329,7 @@ CRN_AD/
 │   ├── physics.py      Henderson–Hasselbalch charges, ΔG matrix, rate constants,
 │   │                   boltzmann_equilibrium_jax (differentiable), boltzmann_initial_state
 │   ├── dynamics.py     ODE system (Diffrax Tsit5), simulate_schedule, lax.scan
-│   ├── training.py     InfoNCE loss, constrain_params, train()
+│   ├── training.py     InfoNCE loss, constrain_params, train(), train_cmaes_hybrid()
 │   └── visualize.py    plot_summary(), animate_crn(), _mn_particle_labels/style
 ├── main.py             CLI (train / eval / animate / csv modes), export_csv()
 ├── boltzmann_scan.py   Thermodynamic parameter sweep (no ODE)

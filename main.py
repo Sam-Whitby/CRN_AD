@@ -36,7 +36,8 @@ import jax.numpy as jnp
 import matplotlib
 matplotlib.use('Agg')
 
-from crn_ad.training  import (train, constrain_params, all_unique_permutations,
+from crn_ad.training  import (train, train_cmaes_hybrid, constrain_params,
+                               all_unique_permutations,
                                correct_bond_score, compute_scores_fast)
 from crn_ad.dynamics  import (simulate_schedule, make_initial_state, make_triu_indices)
 from crn_ad.visualize import (plot_summary, animate_crn,
@@ -196,6 +197,22 @@ def build_parser():
                         'ODE call to this value, using a JAX custom_vjp wrapper.  '
                         'Helps prevent NaN gradients from the adjoint ODE.  '
                         'Try 1.0–10.0; smaller = more aggressive clipping.')
+    # ---- Optimizer selection ----
+    p.add_argument('--optimizer', type=str, default='adam',
+                   choices=['adam', 'hybrid'],
+                   help='Optimisation algorithm.  '
+                        'adam (default): Adam with --n_restarts independent runs.  '
+                        'hybrid: single run of CMA-ES (global basin search) followed '
+                        'by L-BFGS-B (gradient-based polish).  Requires evosax and '
+                        'jaxopt.  Ignores --n_restarts; use --cmaes_epochs / '
+                        '--lbfgs_epochs to control budget instead.')
+    p.add_argument('--cmaes_epochs', type=int, default=200,
+                   help='Number of CMA-ES generations for --optimizer hybrid.  '
+                        'Each generation evaluates popsize ≈ 4+3·ln(n_params) '
+                        'candidates in parallel via vmap.  Default 200.')
+    p.add_argument('--lbfgs_epochs', type=int, default=100,
+                   help='Maximum L-BFGS-B iterations for --optimizer hybrid.  '
+                        'Applied as a gradient-based polish after CMA-ES.  Default 100.')
     # ---- Eval mode: specify all parameters explicitly ----
     p.add_argument('--eval_pKa', nargs='+', type=float, default=None,
                    help='(--mode eval) pKa values, one per species.')
@@ -681,7 +698,15 @@ def main():
 
         n_restarts = int(args.n_restarts)
 
-        if n_restarts > 1:
+        if args.optimizer == 'hybrid':
+            config['cmaes_epochs'] = args.cmaes_epochs
+            config['lbfgs_epochs'] = args.lbfgs_epochs
+            config['verbose']      = True
+            (raw_params, loss_history, score_history, param_history,
+             static, all_schedules, target_idx, *_) = train_cmaes_hybrid(config)
+            best_config = config
+
+        elif n_restarts > 1:
             init_tag = 'wide' if args.wide_init else 'standard'
             print(f'Running {n_restarts} restarts ({init_tag} init) ...')
             seeds = [args.seed + i for i in range(n_restarts)]
