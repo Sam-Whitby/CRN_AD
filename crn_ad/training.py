@@ -73,7 +73,7 @@ _clip_grad_norm.defvjp(_cgn_fwd, _cgn_bwd)
 # Parameter constraints
 # ---------------------------------------------------------------------------
 
-def constrain_params(raw, J_max=3.5, S_max=0.0, fixed_phi=None,
+def constrain_params(raw, J_max=3.5, S_max=0.0, eps_max=0.0, fixed_phi=None,
                      fixed_J=None, fixed_pKa=None):
     """
     Map unconstrained (ℝ) raw parameters to physical ranges.
@@ -82,6 +82,7 @@ def constrain_params(raw, J_max=3.5, S_max=0.0, fixed_phi=None,
     phi            ∈ [0, 1]        via σ(raw)          (or fixed_phi if not None)
     J              ∈ [0.5, J_max]  via 0.5 + (J_max−0.5)·σ(raw)  (or fixed_J if not None)
     monomer_entropy∈ [0, S_max]    via S_max·σ(raw)   (scalar or n-vector)
+    eps_barrier    ∈ [0, eps_max]  via eps_max·σ(raw)  (only when eps_max > 0)
     """
     out = {
         'pKa': (jnp.array(fixed_pKa, dtype=float) if fixed_pKa is not None
@@ -93,10 +94,12 @@ def constrain_params(raw, J_max=3.5, S_max=0.0, fixed_phi=None,
     }
     if S_max > 0.0 and 'monomer_entropy' in raw:
         out['monomer_entropy'] = S_max * jax.nn.sigmoid(raw['monomer_entropy'])
+    if eps_max > 0.0 and 'eps_barrier' in raw:
+        out['eps_barrier'] = eps_max * jax.nn.sigmoid(raw['eps_barrier'])
     return out
 
 
-def unconstrain_params(phys, J_max=3.5, S_max=0.0):
+def unconstrain_params(phys, J_max=3.5, S_max=0.0, eps_max=0.0):
     """Inverse of constrain_params for warm-starting."""
     def _logit(x):
         x = jnp.clip(jnp.array(x), 1e-4, 1 - 1e-4)
@@ -112,6 +115,9 @@ def unconstrain_params(phys, J_max=3.5, S_max=0.0):
     if S_max > 0.0 and 'monomer_entropy' in phys:
         s_norm = jnp.clip(jnp.array(phys['monomer_entropy']) / S_max, 1e-4, 1 - 1e-4)
         out['monomer_entropy'] = jnp.log(s_norm / (1 - s_norm))
+    if eps_max > 0.0 and 'eps_barrier' in phys:
+        eb_norm = jnp.clip(jnp.array(phys['eps_barrier']) / eps_max, 1e-4, 1 - 1e-4)
+        out['eps_barrier'] = jnp.log(eb_norm / (1 - eb_norm))
     return out
 
 
@@ -243,6 +249,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     p = constrain_params(raw_params,
                          J_max=static['J_max'],
                          S_max=static.get('S_max', 0.0),
+                         eps_max=static.get('eps_barrier_max', 0.0),
                          fixed_phi=static.get('fixed_phi'),
                          fixed_J=static.get('fixed_J'),
                          fixed_pKa=static.get('fixed_pKa'))
@@ -252,6 +259,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     no_self_bonds   = bool(static.get('no_self_bonds', False))
     equil_ramp      = float(static.get('equil_ramp_duration', 0.0))
     grad_clip    = static.get('grad_clip', None)
+    eps_b        = p.get('eps_barrier', jnp.array(0.0))
     # pKa array already has one value per particle (2*N_acids elements)
     pKa_full = p['pKa']
 
@@ -283,6 +291,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
             allowed_mask=allowed_mask,
             beta_ramp_duration=equil_ramp,
             no_self_bonds=no_self_bonds,
+            eps_barrier=eps_b,
         )
         # Clip gradient norm flowing back through the equil ODE adjoint.
         if grad_clip is not None:
@@ -313,6 +322,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                 allowed_mask=allowed_mask,
                 no_self_bonds=no_self_bonds,
                 return_traj=True,
+                eps_barrier=eps_b,
             )
             if grad_clip is not None:
                 final = _clip_grad_norm(float(grad_clip), final)
@@ -329,6 +339,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                 allowed_mask=allowed_mask,
                 no_self_bonds=no_self_bonds,
                 return_traj=True,
+                eps_barrier=eps_b,
             )
             post_traj = post_trajs[0]   # (n_pts_post, state_size)
             return integral_bond_score(
@@ -349,6 +360,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                 ph_initial=7.0,
                 allowed_mask=allowed_mask,
                 no_self_bonds=no_self_bonds,
+                eps_barrier=eps_b,
             )
             if grad_clip is not None:
                 final = _clip_grad_norm(float(grad_clip), final)
@@ -399,6 +411,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     mono_s = (_get_monomer_entropy(p_constrained)
               if p_constrained.get('monomer_entropy') is not None else None)
     equil_ramp = float(static.get('equil_ramp_duration', 0.0))
+    eps_b_fast = float(p_constrained.get('eps_barrier', 0.0) or 0.0)
 
     _start_equil  = bool(static.get('start_equil', False))
     _dissoc_state = make_initial_state(static['n'])
@@ -433,6 +446,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                 allowed_mask=allowed_mask,
                 beta_ramp_duration=equil_ramp,
                 no_self_bonds=no_self_bonds,
+                eps_barrier=eps_b_fast,
             )
 
         baseline = correct_bond_score(equil, static['n'],
@@ -452,6 +466,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                     allowed_mask=allowed_mask,
                     no_self_bonds=no_self_bonds,
                     return_traj=True,
+                    eps_barrier=eps_b_fast,
                 )
                 _, post_trajs = simulate_schedule_scan(
                     final, jnp.array([7.0]), _post_dur_f,
@@ -466,6 +481,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                     allowed_mask=allowed_mask,
                     no_self_bonds=no_self_bonds,
                     return_traj=True,
+                    eps_barrier=eps_b_fast,
                 )
                 post_traj = post_trajs[0]
                 return integral_bond_score(
@@ -485,6 +501,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                     monomer_entropy=mono_s,
                     allowed_mask=allowed_mask,
                     no_self_bonds=no_self_bonds,
+                    eps_barrier=eps_b_fast,
                 )
                 return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
@@ -529,6 +546,7 @@ def train(config):
 
     J_max          = float(config.get('J_max', 3.5))
     S_max          = float(config.get('S_max', 0.0))
+    eps_max        = float(config.get('eps_barrier_max', 0.0))
     smooth         = float(config.get('smooth_width', 0.0))
     per_mono       = bool(config.get('per_monomer_entropy', False))
     no_self_bonds  = bool(config.get('no_self_bonds', False))
@@ -597,6 +615,7 @@ def train(config):
         'tau'                : float(config.get('tau', 5.0)),
         'J_max'              : J_max,
         'S_max'              : S_max,
+        'eps_barrier_max'    : eps_max,
         'smooth_width'       : smooth,
         'per_monomer_entropy': per_mono,
         'no_self_bonds'      : no_self_bonds,
@@ -630,8 +649,8 @@ def train(config):
     # entropy: per-particle if per_mono, else shared
     n_entropy = N if per_mono else 1
     if verbose:
-        print(f"N_acids      : {N_acids}  ({M} classifier, {N_acids-M} roughness)")
-        print(f"N_bases      : {N_acids}  ({M} classifier, {N_acids-M} roughness)")
+        print(f"N_acids      : {N_acids}  ({M} classifier, {N_acids-M} competitor)")
+        print(f"N_bases      : {N_acids}  ({M} classifier, {N_acids-M} competitor)")
         print(f"Particles    : {N}  ({N_acids} acids + {N_acids} bases)")
         print(f"Target sched : {target_sched}")
         print(f"Permutations : {len(all_schedules)}  (target idx = {target_idx})")
@@ -652,6 +671,8 @@ def train(config):
         if S_max > 0:
             mode = f"per-particle ({N} values)" if per_mono else "shared (1 value)"
             print(f"Entropy      : S_max = {S_max} kT, {mode}")
+        if eps_max > 0:
+            print(f"ε_‡ max      : {eps_max} kT  (Arrhenius barrier, trainable)")
 
     # ------------------------------------------------------------------
     # Initial parameters  (pKa: one per species, shared across types)
@@ -705,8 +726,14 @@ def train(config):
             )
         init_phys['monomer_entropy'] = jnp.array(s_init)
         init_phys_np['monomer_entropy'] = np.array(s_init)
+    if eps_max > 0.0:
+        # Start near zero so early training is close to Metropolis limit.
+        eps_init = eps_max * 0.05
+        init_phys['eps_barrier'] = jnp.array(eps_init)
+        init_phys_np['eps_barrier'] = float(eps_init)
 
-    raw_params = unconstrain_params(init_phys, J_max=J_max, S_max=S_max)
+    raw_params = unconstrain_params(init_phys, J_max=J_max, S_max=S_max,
+                                    eps_max=eps_max)
 
     # The fully-dissociated state is passed when start_equil=False.
     # When start_equil=True, compute_loss calls boltzmann_equilibrium_jax
@@ -773,9 +800,10 @@ def train(config):
     loss_history  = [float(lv)]
     score_history = [np.array(sc)]
 
-    p0 = constrain_params(raw_params, J_max=J_max, S_max=S_max, fixed_phi=fixed_phi_val,
-                          fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val)
-    param_history = [_snapshot(p0, S_max)]
+    p0 = constrain_params(raw_params, J_max=J_max, S_max=S_max, eps_max=eps_max,
+                          fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
+                          fixed_pKa=fixed_pKa_val)
+    param_history = [_snapshot(p0, S_max, eps_max)]
 
     nan_stopped = False
     for epoch in range(1, n_epochs):
@@ -795,9 +823,9 @@ def train(config):
         loss_history.append(float(lv))
         score_history.append(np.array(sc))
         p_cur = constrain_params(raw_params, J_max=J_max, S_max=S_max,
-                                  fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
-                                  fixed_pKa=fixed_pKa_val)
-        param_history.append(_snapshot(p_cur, S_max))
+                                  eps_max=eps_max, fixed_phi=fixed_phi_val,
+                                  fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val)
+        param_history.append(_snapshot(p_cur, S_max, eps_max))
 
         if verbose and (epoch % max(1, n_epochs // 15) == 0 or epoch == n_epochs - 1):
             pKa_arr    = [float(v) for v in p_cur['pKa']]
@@ -809,6 +837,9 @@ def train(config):
             if S_max > 0.0 and 'monomer_entropy' in p_cur:
                 s = p_cur['monomer_entropy']
                 s_str = f' | s̄={float(jnp.mean(s)):.3f} sₘₐₓ={float(jnp.max(s)):.3f}'
+            eps_str    = ''
+            if eps_max > 0.0 and 'eps_barrier' in p_cur:
+                eps_str = f' | ε_‡={float(p_cur["eps_barrier"]):.3f}'
             phi_str    = (f'{fixed_phi_val:.3f} (fixed)' if fixed_phi_val is not None
                           else f'{float(p_cur["phi"]):.3f}')
             J_str      = (f'{fixed_J_val:.3f} (fixed)' if fixed_J_val is not None
@@ -826,7 +857,7 @@ def train(config):
                 f"{other_str}"
                 f"baseline={baseline:.3f}{bl_tag} | "
                 f"pKa=[{pKa_str}] | φ={phi_str} | "
-                f"J={J_str}{s_str}",
+                f"J={J_str}{s_str}{eps_str}",
                 flush=True,
             )
 
@@ -837,8 +868,8 @@ def train(config):
             print("\nTraining complete.")
 
     p_final  = constrain_params(raw_params, J_max=J_max, S_max=S_max,
-                               fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
-                               fixed_pKa=fixed_pKa_val)
+                               eps_max=eps_max, fixed_phi=fixed_phi_val,
+                               fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val)
     mono_s   = _get_monomer_entropy(p_final)
     pKa_full = p_final['pKa']
     if start_equil:
@@ -853,6 +884,7 @@ def train(config):
             no_self_bonds=no_self_bonds,
         ))
     else:
+        eps_b_final = float(p_final.get('eps_barrier', 0.0) or 0.0)
         equil_state = simulate_schedule_scan(
             initial_state, jnp.array([7.0]), static['equil_duration'],
             pKa_full, static['acid_base'], p_final['phi'], p_final['J'],
@@ -863,6 +895,7 @@ def train(config):
             allowed_mask=allowed_mask_jax,
             beta_ramp_duration=static['equil_ramp_duration'],
             no_self_bonds=no_self_bonds,
+            eps_barrier=eps_b_final,
         )
 
     return (raw_params, loss_history, score_history, param_history,
@@ -870,10 +903,12 @@ def train(config):
             init_phys_np, nan_stopped)
 
 
-def _snapshot(p, S_max):
+def _snapshot(p, S_max, eps_max=0.0):
     snap = {'pKa': np.array(p['pKa']), 'phi': float(p['phi']), 'J': float(p['J'])}
     if S_max > 0.0 and 'monomer_entropy' in p:
         snap['monomer_entropy'] = np.array(p['monomer_entropy'])
+    if eps_max > 0.0 and 'eps_barrier' in p:
+        snap['eps_barrier'] = float(p['eps_barrier'])
     return snap
 
 
@@ -914,6 +949,7 @@ def train_cmaes_hybrid(config):
 
     J_max         = float(config.get('J_max', 3.5))
     S_max         = float(config.get('S_max', 0.0))
+    eps_max       = float(config.get('eps_barrier_max', 0.0))
     smooth        = float(config.get('smooth_width', 0.0))
     per_mono      = bool(config.get('per_monomer_entropy', False))
     no_self_bonds = bool(config.get('no_self_bonds', False))
@@ -970,6 +1006,7 @@ def train_cmaes_hybrid(config):
         'tau'                : float(config.get('tau', 5.0)),
         'J_max'              : J_max,
         'S_max'              : S_max,
+        'eps_barrier_max'    : eps_max,
         'smooth_width'       : smooth,
         'per_monomer_entropy': per_mono,
         'no_self_bonds'      : no_self_bonds,
@@ -1035,8 +1072,13 @@ def train_cmaes_hybrid(config):
             )
         init_phys['monomer_entropy'] = jnp.array(s_init)
         init_phys_np['monomer_entropy'] = np.array(s_init)
+    if eps_max > 0.0:
+        eps_init = eps_max * 0.05
+        init_phys['eps_barrier'] = jnp.array(eps_init)
+        init_phys_np['eps_barrier'] = float(eps_init)
 
-    raw_params_init = unconstrain_params(init_phys, J_max=J_max, S_max=S_max)
+    raw_params_init = unconstrain_params(init_phys, J_max=J_max, S_max=S_max,
+                                         eps_max=eps_max)
     initial_state   = make_initial_state(N)
 
     loss_fn = partial(
@@ -1062,17 +1104,20 @@ def train_cmaes_hybrid(config):
     # ------------------------------------------------------------------
     _n_pka = 2 * N_acids
     _n_ent = n_entropy if S_max > 0.0 else 0
-    n_phys = _n_pka + 2 + _n_ent
+    _n_eps = 1 if eps_max > 0.0 else 0
+    n_phys = _n_pka + 2 + _n_ent + _n_eps
 
     _lo_arr = np.concatenate([
         [3.01] * _n_pka,
         [0.001, 0.51],
         ([0.001 * S_max] * _n_ent if _n_ent > 0 else []),
+        ([0.001 * eps_max]         if _n_eps > 0 else []),
     ])
     _hi_arr = np.concatenate([
         [9.99] * _n_pka,
         [0.999, J_max - 0.01],
         ([0.999 * S_max] * _n_ent if _n_ent > 0 else []),
+        ([0.999 * eps_max]         if _n_eps > 0 else []),
     ])
     scipy_bounds = list(zip(_lo_arr.tolist(), _hi_arr.tolist()))
 
@@ -1084,8 +1129,10 @@ def train_cmaes_hybrid(config):
             'J':   phys_flat[_n_pka + 1],
         }
         if S_max > 0.0:
-            phys['monomer_entropy'] = phys_flat[_n_pka + 2:]
-        raw = unconstrain_params(phys, J_max=J_max, S_max=S_max)
+            phys['monomer_entropy'] = phys_flat[_n_pka + 2 : _n_pka + 2 + _n_ent]
+        if eps_max > 0.0:
+            phys['eps_barrier'] = phys_flat[_n_pka + 2 + _n_ent]
+        raw = unconstrain_params(phys, J_max=J_max, S_max=S_max, eps_max=eps_max)
         loss_val, _ = loss_fn(raw)
         return loss_val
 
@@ -1096,6 +1143,8 @@ def train_cmaes_hybrid(config):
                        + [float(init_phys_np['phi']), float(init_phys_np['J'])])
     if S_max > 0.0:
         _init_phys_list += list(np.array(init_phys_np.get('monomer_entropy', [])))
+    if eps_max > 0.0:
+        _init_phys_list += [float(init_phys_np.get('eps_barrier', eps_max * 0.05))]
     _init_phys_flat = np.array(_init_phys_list, dtype=np.float64)
 
     if verbose:
@@ -1139,12 +1188,14 @@ def train_cmaes_hybrid(config):
             'J':   jnp.array(float(pf[_n_pka + 1])),
         }
         if S_max > 0.0:
-            phys_d['monomer_entropy'] = jnp.array(pf[_n_pka + 2:])
-        raw_d  = unconstrain_params(phys_d, J_max=J_max, S_max=S_max)
-        phys_c = constrain_params(raw_d, J_max=J_max, S_max=S_max,
+            phys_d['monomer_entropy'] = jnp.array(pf[_n_pka + 2 : _n_pka + 2 + _n_ent])
+        if eps_max > 0.0:
+            phys_d['eps_barrier'] = jnp.array(float(pf[_n_pka + 2 + _n_ent]))
+        raw_d  = unconstrain_params(phys_d, J_max=J_max, S_max=S_max, eps_max=eps_max)
+        phys_c = constrain_params(raw_d, J_max=J_max, S_max=S_max, eps_max=eps_max,
                                   fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
                                   fixed_pKa=fixed_pKa_val)
-        return _snapshot(phys_c, S_max)
+        return _snapshot(phys_c, S_max, eps_max)
 
     for restart_i in range(n_restarts):
         x0  = sobol_phys[restart_i]
@@ -1202,13 +1253,18 @@ def train_cmaes_hybrid(config):
         'J':   jnp.array(float(best_phys_flat[_n_pka + 1])),
     }
     if S_max > 0.0:
-        best_phys_d['monomer_entropy'] = jnp.array(best_phys_flat[_n_pka + 2:])
-    raw_params = unconstrain_params(best_phys_d, J_max=J_max, S_max=S_max)
+        best_phys_d['monomer_entropy'] = jnp.array(
+            best_phys_flat[_n_pka + 2 : _n_pka + 2 + _n_ent])
+    if eps_max > 0.0:
+        best_phys_d['eps_barrier'] = jnp.array(
+            float(best_phys_flat[_n_pka + 2 + _n_ent]))
+    raw_params = unconstrain_params(best_phys_d, J_max=J_max, S_max=S_max,
+                                    eps_max=eps_max)
 
     if verbose:
         p_final_v = constrain_params(raw_params, J_max=J_max, S_max=S_max,
-                                     fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
-                                     fixed_pKa=fixed_pKa_val)
+                                     eps_max=eps_max, fixed_phi=fixed_phi_val,
+                                     fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val)
         pKa_arr  = [float(v) for v in p_final_v['pKa']]
         acid_str = ' '.join(f'{v:.2f}' for v in pKa_arr[:N_acids])
         base_str = ' '.join(f'{v:.2f}' for v in pKa_arr[N_acids:])
@@ -1222,8 +1278,8 @@ def train_cmaes_hybrid(config):
     # Compute equilibrium state for visualisation (same as end of train())
     # ------------------------------------------------------------------
     p_final  = constrain_params(raw_params, J_max=J_max, S_max=S_max,
-                                fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
-                                fixed_pKa=fixed_pKa_val)
+                                eps_max=eps_max, fixed_phi=fixed_phi_val,
+                                fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val)
     mono_s   = _get_monomer_entropy(p_final)
     pKa_full = p_final['pKa']
     if start_equil:
@@ -1237,6 +1293,7 @@ def train_cmaes_hybrid(config):
             no_self_bonds=no_self_bonds,
         ))
     else:
+        eps_b_hybrid = float(p_final.get('eps_barrier', 0.0) or 0.0)
         equil_state = simulate_schedule_scan(
             initial_state, jnp.array([7.0]), static['equil_duration'],
             pKa_full, static['acid_base'], p_final['phi'], p_final['J'],
@@ -1247,6 +1304,7 @@ def train_cmaes_hybrid(config):
             allowed_mask=allowed_mask_jax,
             beta_ramp_duration=static['equil_ramp_duration'],
             no_self_bonds=no_self_bonds,
+            eps_barrier=eps_b_hybrid,
         )
 
     return (raw_params, loss_history, [], param_history,

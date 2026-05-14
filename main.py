@@ -134,6 +134,18 @@ def build_parser():
                         'parameters s_i ∈ [0, S_max] kT.  Each monomer '
                         'contributes s_i to the dimerisation free energy: '
                         'ΔG_ij += s_i + s_j.  Optimised by autodiff.')
+    p.add_argument('--eps_barrier_max', type=float, default=0.0,
+                   help='If > 0, enable a trainable intrinsic activation barrier '
+                        'ε_‡ ∈ [0, eps_barrier_max] kT for all contacts.  '
+                        'ε_‡ is the Arrhenius reorganisation cost paid to '
+                        'form or break a contact regardless of bond strength, '
+                        'corresponding to chain stretching and solvation-shell '
+                        'reorganisation.  It slows all kinetics by '
+                        'exp(−β·ε_‡) without changing equilibrium constants.  '
+                        'Physically calibrated range: 2–10 kT '
+                        '(Hyeon & Thirumalai 2003).  '
+                        'Recommended: use --start_equil when eps_barrier_max > 0 '
+                        'to avoid extremely slow ODE equilibration.')
     p.add_argument('--per_monomer_entropy', action='store_true',
                    help='If set, train a separate entropy value per monomer '
                         '(n values).  Default: one shared value for all.')
@@ -350,6 +362,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
     n_pts_post    = int(static.get('n_points_post', max(20, int(2 * post_duration))))
 
     pKa_full = jnp.array(p['pKa'])
+    eps_b    = float(p.get('eps_barrier', 0.0) or 0.0)
 
     if static.get('start_equil', False):
         equil_final = jnp.array(_bis(
@@ -375,6 +388,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
             allowed_mask=allowed_mask,
             beta_ramp_duration=equil_ramp,
             no_self_bonds=no_self_bonds,
+            eps_barrier=eps_b,
         )
         equil_traj_data = np.array(equil_traj[0])
 
@@ -388,6 +402,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
         monomer_entropy=mono_s,
         allowed_mask=allowed_mask,
         no_self_bonds=no_self_bonds,
+        eps_barrier=eps_b,
     )
 
     if post_duration > 0:
@@ -401,6 +416,7 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
             monomer_entropy=mono_s,
             allowed_mask=allowed_mask,
             no_self_bonds=no_self_bonds,
+            eps_barrier=eps_b,
         )
         post_traj = np.array(post_traj_list[0])
     else:
@@ -675,6 +691,7 @@ def main():
             J_max                = args.J_max,
             smooth_width         = args.smooth_width,
             S_max                = args.S_max,
+            eps_barrier_max      = args.eps_barrier_max,
             per_monomer_entropy  = args.per_monomer_entropy,
             no_self_bonds        = args.no_self_bonds,
             wide_init            = args.wide_init,
@@ -764,6 +781,7 @@ def main():
         _fixed_pKa_eval = ([args.pKa_acid]*args.N + [args.pKa_base]*args.N
                             if args.pka_default else None)
         p_eval = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max,
+                                  eps_max=args.eps_barrier_max,
                                   fixed_phi=args.fixed_phi, fixed_J=args.fixed_J,
                                   fixed_pKa=_fixed_pKa_eval)
         p_eval = {k: (np.array(v) if hasattr(v, '__len__') else float(v))
@@ -794,6 +812,8 @@ def main():
         if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
             params_out['monomer_entropy'] = np.atleast_1d(
                 p_eval['monomer_entropy']).tolist()
+        if args.eps_barrier_max > 0.0 and p_eval.get('eps_barrier') is not None:
+            params_out['eps_barrier'] = float(p_eval['eps_barrier'])
 
         with open(params_path, 'w') as f:
             json.dump(params_out, f, indent=2)
@@ -847,6 +867,7 @@ def main():
             'J'  : float(pdata['J']),
             'monomer_entropy': (np.array(pdata['monomer_entropy'])
                                 if 'monomer_entropy' in pdata else None),
+            'eps_barrier': float(pdata.get('eps_barrier', 0.0)),
         }
         target_sched  = [float(x) for x in pdata['target_pH_schedule']]
         all_schedules = all_unique_permutations(target_sched)

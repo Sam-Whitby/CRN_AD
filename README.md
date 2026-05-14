@@ -17,11 +17,11 @@ Particles are labelled according to their role:
 | Label | Type | Role |
 |-------|------|------|
 | **A1, A2, …, AM** | Acid | Classifier — forms the correct bond A*i* ↔ B*i* |
-| **a1, a2, …, a(N−M)** | Acid | Roughness — no correct bond; introduces kinetic disorder |
+| **a1, a2, …, a(N−M)** | Acid | Competitor — no correct bond; introduces kinetic disorder |
 | **B1, B2, …, BM** | Base | Classifier — correct partner to A*i* |
-| **b1, b2, …, b(N−M)** | Base | Roughness — no correct bond |
+| **b1, b2, …, b(N−M)** | Base | Competitor — no correct bond |
 
-In all plots: **classifier** species use thick solid lines; **roughness** species use thin dashed lines. Acids are coloured in red/orange shades; bases in blue/cyan shades.
+In all plots: **classifier** species use thick solid lines; **competitor** species use thin dashed lines. Acids are coloured in red/orange shades; bases in blue/cyan shades.
 
 ---
 
@@ -29,9 +29,9 @@ In all plots: **classifier** species use thick solid lines; **roughness** specie
 
 ### Species and reactions
 
-The system contains `2N` monomer particles: `N` acid-like particles and `N` base-like particles. Every ordered pair can dimerise reversibly. The `M ≤ N` **classifier pairs** are A*i* ↔ B*i* for *i* = 1…M. The remaining `N−M` acid/base particles (a1…and b1…) are **roughness species** — they have no correct bond and participate only in wrong-bond interactions, introducing energetic disorder into the landscape.
+The system contains `2N` monomer particles: `N` acid-like particles and `N` base-like particles. Every ordered pair can dimerise reversibly. The `M ≤ N` **classifier pairs** are A*i* ↔ B*i* for *i* = 1…M. The remaining `N−M` acid/base particles (a1…and b1…) are **competitor species** — they have no correct bond and participate only in wrong-bond interactions, introducing energetic disorder into the landscape.
 
-Setting `M = N` recovers a pure-classifier model (no roughness). Setting `M < N` creates the disordered rugged landscape: the spread of pKa values across roughness species generates a Gaussian distribution of wrong-bond energies, giving the system kinetic memory of the sequence history.
+Setting `M = N` recovers a pure-classifier model (no competitors). Setting `M < N` creates a disordered landscape: the spread of pKa values across competitor species generates a distribution of wrong-bond energies, giving the system kinetic memory of the sequence history.
 
 ### Henderson–Hasselbalch charges
 
@@ -53,12 +53,18 @@ Opposite-sign charges attract, so correct classifier acid–base pairs bind.
 
 ### Kinetics (detailed balance)
 
+Both forward and reverse reactions pay an intrinsic activation barrier ε_‡ ≥ 0 (in kT):
+
 ```
-k_fwd = k₀ · exp(−β · max(ΔG, 0))
-k_bwd = k₀ · exp(+β · min(ΔG, 0))
+k_fwd = k₀ · exp(−β · (ε_‡ + max(ΔG, 0)))
+k_bwd = k₀ · exp(−β · (ε_‡ + max(−ΔG, 0)))
 ```
 
-The ratio k_fwd / k_bwd = exp(−β·ΔG) satisfies detailed balance. `k₀` is the base rate constant (default 1); `β = 1/kT` (default 1, so J is in kT).
+The ratio k_fwd / k_bwd = exp(−β·ΔG) satisfies detailed balance regardless of ε_‡. `k₀` is the base rate constant (default 1); `β = 1/kT` (default 1, so J is in kT).
+
+**Physical meaning of ε_‡:** Even a thermodynamically favourable contact (ΔG < 0) requires chain stretching and solvation-shell reorganisation before the electrostatic gain is realised. This intrinsic barrier slows all association/dissociation rates uniformly by exp(−β·ε_‡) without altering equilibrium constants. With J = 5 kT and ε_‡ = 10 kT, the trapping timescale τ ~ exp(β(ε_‡ + |ΔG|))/k₀ matches that of Metropolis kinetics (ε_‡ = 0) with J = 15 kT, allowing physically realistic coupling strengths.
+
+Setting ε_‡ = 0 (default) exactly recovers the original Metropolis kinetics. Enable training of ε_‡ via `--eps_barrier_max`.
 
 ### ODE and conservation
 
@@ -126,7 +132,7 @@ For the hybrid optimiser (`--optimizer hybrid`): `evosax>=0.1.6` is listed in `r
 
 ```bash
 python main.py
-# Default: N=4, M=2 → 4 acids + 4 bases, 2 classifier pairs + 2 roughness pairs
+# Default: N=4, M=2 → 4 acids + 4 bases, 2 classifier pairs + 2 competitor pairs
 # Target schedule [9, 5, 7], 300 epochs, outdir=outputs/
 ```
 
@@ -137,10 +143,10 @@ python main.py --N 6 --M 3 --target_pH 9 5 7 \
   --duration 40 --equil_duration 100 --n_epochs 500 \
   --lr 0.03 --outdir results/N6M3
 
-# Pure classifier (no roughness)
+# Pure classifier (no competitors)
 python main.py --N 4 --M 4 --target_pH 9 5 7
 
-# Many roughness species for strong kinetic memory
+# Many competitor species for strong kinetic memory
 python main.py --N 8 --M 2 --target_pH 9 5 7
 ```
 
@@ -243,7 +249,7 @@ python main.py --J_max 10.0 --smooth_width 2.0 --J_init_max
 |----------|---------|-------------|
 | `--mode` | `train` | `train` · `animate` · `both` · `eval` · `csv` |
 | `--N` | `4` | Number of acid species (= base species). Total particles = 2N. |
-| `--M` | `2` | Classifier pairs M ≤ N. Ai ↔ Bi for i = 1…M. Remaining N−M pairs are roughness. |
+| `--M` | `2` | Classifier pairs M ≤ N. Ai ↔ Bi for i = 1…M. Remaining N−M pairs are competitors. |
 | `--target_pH` | `9.0 5.0 7.0` | Target pH schedule. |
 | `--duration` | `30.0` | Duration per pH segment (units of 1/k₀). |
 | `--equil_duration` | `80.0` | pH-7 pre-equilibration duration. Ignored with `--start_equil`. |
@@ -261,6 +267,7 @@ python main.py --J_max 10.0 --smooth_width 2.0 --J_init_max
 | `--k0` | `1.0` | Base rate k₀ — absorbed into durations. |
 | `--beta` | `1.0` | Inverse temperature β (1 = energies in kT). |
 | `--J_max` | `3.5` | Upper bound on J (kT). |
+| `--eps_barrier_max` | `0.0` | If > 0, enable a trainable intrinsic activation barrier ε_‡ ∈ [0, eps_barrier_max] kT. Both k_fwd and k_bwd are reduced by exp(−β·ε_‡), preserving equilibrium constants. Typical range: 5–10 kT. Use with `--start_equil` to avoid slow ODE equilibration. |
 | `--smooth_width` | `0.0` | Sigmoid width for pH transitions (0 = step). Recommended ≥1 for J_max > 5. |
 | `--no_self_bonds` | off | Identical particles have ΔG = 0. |
 
@@ -314,7 +321,7 @@ python main.py --J_max 10.0 --smooth_width 2.0 --J_init_max
 ### Reading `summary.png`
 
 - **Loss panel**: InfoNCE training loss vs epoch. Annotated with best seed (when using `--n_restarts`).
-- **pKa evolution**: per-species pKa trajectories. Classifier acids (A1…) are thick solid red/dark-red; roughness acids (a1…) thin dashed orange; classifier bases (B1…) thick solid blue; roughness bases (b1…) thin dashed cyan.
+- **pKa evolution**: per-species pKa trajectories. Classifier acids (A1…) are thick solid red/dark-red; competitor acids (a1…) thin dashed orange; classifier bases (B1…) thick solid blue; competitor bases (b1…) thin dashed cyan.
 - **φ and J evolution**: parameter trajectories during training.
 - **Concentration panel**: correct dimer species (individual lines, purple/teal shades) and aggregate Σ-correct (green solid) and Σ-incorrect (red solid) with Boltzmann equilibrium reference lines (dotted same color).
 - **ΔG vs pH panel**: free energy curves for (1) each correct bond A*i*–B*i* (solid colored), (2) each classifier acid vs Σ roughness bases (dashed red, represents total competitor load), (3) each classifier base vs Σ roughness acids (dashed blue).

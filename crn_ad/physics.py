@@ -64,28 +64,46 @@ def interaction_energy_matrix(charges, correct_mask, phi, J,
     return dG
 
 
-def rate_matrices(dG, beta, k0):
+def rate_matrices(dG, beta, k0, eps_barrier=0.0):
     """
-    Metropolis kinetics — guaranteed detailed balance for all ΔG.
+    Arrhenius kinetics with intrinsic activation barrier — guaranteed detailed balance.
 
-    k_f^{ij} = k0 · exp(−β · max(ΔG_{ij}, 0))
-    k_b^{ij} = k0 · exp(+β · min(ΔG_{ij}, 0))
+    k_f^{ij} = k0 · exp(−β · (ε_‡ + max(ΔG_{ij}, 0)))
+    k_b^{ij} = k0 · exp(−β · (ε_‡ + max(−ΔG_{ij}, 0)))
 
-    When ΔG ≤ 0 (favourable formation):
-        k_f = k0            — formation is unimpeded
-        k_b = k0·exp(βΔG) < k0  — breaking is slowed by the Boltzmann factor
-    When ΔG > 0 (unfavourable formation):
-        k_f = k0·exp(−βΔG) < k0 — formation is penalised
-        k_b = k0            — breaking is unimpeded
+    Both forward and reverse rates share the barrier ε_‡ ≥ 0, so their
+    ratio k_f / k_b = exp(−β·ΔG) for all ΔG  ✓  (detailed balance).
+    The equilibrium constant K = exp(−β·ΔG) is unchanged by ε_‡.
 
-    Ratio:  k_f / k_b = exp(−β·ΔG)  in both cases  ✓  (detailed balance).
+    Physical meaning of ε_‡:
+        Forming or breaking a contact requires chain stretching and
+        solvation-shell reorganisation, costing ε_‡ kT even when the
+        reaction is thermodynamically downhill.  This is the Arrhenius
+        activation energy in the absence of electrostatic driving.
+        Measured protein energy-landscape roughness: 2–5 kT
+        (Hyeon & Thirumalai 2003, PNAS 100, 10249).
 
-    This is the continuous-time analogue of Metropolis–Hastings: the
-    system moves at full speed whenever a reaction is downhill, and only
-    pays a kinetic cost when climbing an energy barrier.
+    Trapping timescale for a bond of strength |ΔG|:
+        τ_trap ~ k0⁻¹ · exp(β · (ε_‡ + |ΔG|))
+
+    This allows a physically realistic J ≲ 8 kT combined with
+    ε_‡ ~ 5–10 kT to give the same kinetic memory as J = 20 kT under
+    the Metropolis (ε_‡ = 0) limit.
+
+    Connection to Zwanzig roughness:
+        If ε_‡ varies across contact sites with Gaussian variance σ²,
+        the mean rate acquires an additional exp(−β²σ²/2) factor — the
+        Zwanzig landscape-roughness correction — without any assumption
+        about the dimensionality of the energy landscape.  The variance
+        σ² = Var(φ·J·q_i·q_j) over non-native contacts is determined
+        entirely by the model parameters φ, J, and the pH-dependent
+        charge distribution.
+
+    At eps_barrier = 0 the expressions reduce to standard Metropolis
+    kinetics (downhill reactions are unimpeded).
     """
-    kf = k0 * jnp.exp(-beta * jnp.maximum(dG, 0.0))
-    kb = k0 * jnp.exp( beta * jnp.minimum(dG, 0.0))
+    kf = k0 * jnp.exp(-beta * (eps_barrier + jnp.maximum( dG, 0.0)))
+    kb = k0 * jnp.exp(-beta * (eps_barrier + jnp.maximum(-dG, 0.0)))
     return kf, kb
 
 
