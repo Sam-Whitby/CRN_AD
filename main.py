@@ -299,10 +299,12 @@ def _run_one_restart(config_seed):
     Returns a dict of numpy-serialisable results.
     """
     import jax as _jax
+    import jax.numpy as _jnp
     _jax.config.update("jax_enable_x64", True)
     config, seed, wide_init = config_seed
     config = {**config, 'seed': seed, 'wide_init': wide_init, 'verbose': False}
     from crn_ad.training import train as _train, constrain_params as _cp
+    from crn_ad.dynamics import make_triu_indices as _mti
     import numpy as _np
 
     result = _train(config)
@@ -314,12 +316,36 @@ def _run_one_restart(config_seed):
     _pKa_base = config.get('pKa_base', 8.0)
     _fixed_pKa = ([_pKa_acid]*_N_acids + [_pKa_base]*_N_acids
                   if _pka_default else None)
+    _chain_mode = bool(config.get('chain_mode', False))
+    _chain_static = None
+    if _chain_mode:
+        _N = 2 * _N_acids
+        _M = int(config.get('M_classifier', 1))
+        _cm = _np.zeros((_N, _N), dtype=bool)
+        for _ci in range(_M):
+            _cm[_ci, _N_acids + _ci] = True
+            _cm[_N_acids + _ci, _ci] = True
+        _chain_static = {
+            'correct_mask': _jnp.array(_cm),
+            'L_chain':      float(config.get('L_chain', 100.0)),
+            'lambda_c':     float(config.get('lambda_c', 20.0)),
+            'l0':           float(config.get('l0', 3.0)),
+            'd0':           float(config.get('d0', 3.0)),
+            'k0':           float(config.get('k0', 1.0)),
+            'phi0':         float(config.get('phi0', 1.0)),
+            'chain_alpha':  float(config.get('chain_alpha', 1.5)),
+            'chain_eps_d':  float(config.get('chain_eps_d', 0.5)),
+        }
     p = _cp(raw_params,
             J_max=config.get('J_max', 3.5),
             S_max=config.get('S_max', 0.0),
             fixed_phi=config.get('fixed_phi'),
             fixed_J=config.get('fixed_J'),
-            fixed_pKa=_fixed_pKa)
+            fixed_pKa=_fixed_pKa,
+            chain_mode=_chain_mode,
+            chain_static=_chain_static)
+    # Exclude large chain-derived matrices — they're recomputed from x at load time.
+    _skip = {'phi_matrix', 'pair_entropy', 'k0_matrix'}
     return {
         'seed'              : seed,
         'wide_init'         : wide_init,
@@ -329,7 +355,7 @@ def _run_one_restart(config_seed):
         'init_params'       : init_phys_np,
         'raw_params'        : {k: _np.array(v) for k, v in raw_params.items()},
         'p_eval'            : {k: (_np.array(v) if hasattr(v, 'shape') else float(v))
-                               for k, v in p.items()},
+                               for k, v in p.items() if k not in _skip},
         'loss_history'      : loss_history,
         'score_history'     : [_np.array(s) for s in score_history],
         'param_history'     : param_history,
@@ -831,17 +857,22 @@ def main():
                 restart_results = [_run_one_restart(p) for p in pairs]
 
             # Print summary table
-            n_epochs_req = int(config['n_epochs'])
-            S_max_cfg    = float(config.get('S_max', 0.0))
-            print(f'  {"seed":>5}  {"init":>8}  {"start pKa (2N values)":<30}  '
-                  f'{"φ":>5}  {"J":>5}'
+            n_epochs_req  = int(config['n_epochs'])
+            S_max_cfg     = float(config.get('S_max', 0.0))
+            _chain_cfg    = bool(config.get('chain_mode', False))
+            _phi_hdr      = '  x̄_i' if _chain_cfg else f'  {"φ":>5}'
+            print(f'  {"seed":>5}  {"init":>8}  {"start pKa (2N values)":<30}'
+                  + _phi_hdr + f'  {"J":>5}'
                   + (f'  {"s̄":>5}' if S_max_cfg > 0 else '')
                   + f'  {"epochs":>11}  {"loss":>8}')
             print('  ' + '─' * (70 + (8 if S_max_cfg > 0 else 0)))
             for r in restart_results:
                 ip       = r['init_params']
                 pKa_str  = ' '.join(f'{float(v):5.2f}' for v in ip['pKa'])
-                phi_str  = f'{float(ip["phi"]):5.3f}'
+                if _chain_cfg:
+                    phi_str = f'{"chain":>5}'
+                else:
+                    phi_str = f'{float(ip["phi"]):5.3f}'
                 J_str    = f'{float(ip["J"]):5.3f}'
                 s_str    = (f'  {float(np.mean(ip["monomer_entropy"])):5.3f}'
                             if S_max_cfg > 0 and 'monomer_entropy' in ip else
@@ -913,6 +944,7 @@ def main():
             params_out['eps_barrier'] = float(p_eval['eps_barrier'])
         if args.chain_positions and 'x' in p_eval:
             params_out['x']           = np.array(p_eval['x']).tolist()
+            params_out['x_residues']  = (np.array(p_eval['x']) * args.L_chain).tolist()
             params_out['chain_mode']   = True
             params_out['L_chain']      = args.L_chain
             params_out['lambda_c']     = args.lambda_c
@@ -920,6 +952,7 @@ def main():
             params_out['d0']           = args.d0
             params_out['phi0']         = args.phi0
             params_out['chain_alpha']  = args.chain_alpha
+            params_out['chain_eps_d']  = static.get('chain_eps_d', 0.5)
 
         with open(params_path, 'w') as f:
             json.dump(params_out, f, indent=2)

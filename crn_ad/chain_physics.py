@@ -88,27 +88,33 @@ def compute_chain_quantities(x, correct_mask, L_chain, lambda_c, l0, d0,
     """
     Derive all chain-physics quantities from residue positions x.
 
+    Mean-field 3D Gaussian chain model: φ_ij = 1 for all pairs (native and
+    non-native alike).  Discrimination between native and non-native contacts
+    comes entirely from ΔS_ij (Jacobson–Stockmayer loop-closure entropy) and
+    k0_ij (Wilemski–Fixman contact rate).  The (3/2) exponents in both
+    formulas encode averaging over all 3D Gaussian-chain conformations.
+
     Parameters
     ----------
     x            : JAX array (2N,)   normalised positions ∈ [0, 1]
     correct_mask : JAX bool (2N, 2N) True for native classifier pairs
     L_chain      : float             chain length in residues
-    lambda_c     : float             contact locality scale (residues)
+    lambda_c     : float             unused (kept for backward compatibility)
     l0           : float             entropy reference separation (residues)
     d0           : float             rate-prefactor reference separation (residues)
     k0_base      : float             base rate constant (units of main k0)
-    phi0         : float             max non-native phi at shortest separation
+    phi0         : float             unused (kept for backward compatibility)
     alpha        : float             Rouse/WF exponent (default 1.5)
     eps_d        : float             d=0 regularisation offset (residues)
 
     Returns
     -------
-    phi_matrix   : (2N, 2N)  contact selectivity (1 for native, ≤phi0 for non-native)
+    phi_matrix   : (2N, 2N)  all-ones — φ = 1 everywhere (mean-field chain)
     pair_entropy : (2N, 2N)  loop-closure entropy cost ΔS_ij  (kT, additive to ΔG)
     k0_matrix    : (2N, 2N)  pair-specific rate prefactors
     """
     d_ij         = compute_pair_separation(x, L_chain, eps_d)
-    phi_matrix   = compute_phi_matrix(d_ij, correct_mask, phi0, lambda_c)
+    phi_matrix   = jnp.ones_like(d_ij)   # φ=1: mean-field 3D Gaussian chain
     pair_entropy = compute_pair_entropy(d_ij, l0)
     k0_matrix    = compute_k0_matrix(d_ij, k0_base, d0, alpha)
     return phi_matrix, pair_entropy, k0_matrix

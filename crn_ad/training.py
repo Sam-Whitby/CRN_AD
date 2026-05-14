@@ -118,8 +118,7 @@ def constrain_params(raw, J_max=3.5, S_max=0.0, eps_max=0.0, fixed_phi=None,
         out['phi_matrix']   = phi_m
         out['pair_entropy'] = ent_m
         out['k0_matrix']    = k0_m
-        # Scalar phi for reporting/visualisation (mean non-native selectivity).
-        out['phi'] = jnp.mean(phi_m * ~chain_static['correct_mask'])
+        out['phi']          = jnp.array(1.0)   # φ≡1 by construction in chain mode
     else:
         out['phi'] = (jnp.array(float(fixed_phi)) if fixed_phi is not None
                       else jax.nn.sigmoid(raw['phi']))
@@ -1003,7 +1002,8 @@ def train(config):
 
 
 def _snapshot(p, S_max, eps_max=0.0, chain_mode=False):
-    snap = {'pKa': np.array(p['pKa']), 'phi': float(p['phi']), 'J': float(p['J'])}
+    phi_val = 1.0 if chain_mode else float(p['phi'])
+    snap = {'pKa': np.array(p['pKa']), 'phi': phi_val, 'J': float(p['J'])}
     if chain_mode and 'x' in p:
         snap['x'] = np.array(p['x'])
     if S_max > 0.0 and 'monomer_entropy' in p:

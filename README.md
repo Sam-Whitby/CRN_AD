@@ -336,15 +336,15 @@ python main.py --J_max 10.0 --smooth_width 2.0 --J_init_max
 
 ### Motivation
 
-The standard model treats φ (steric mismatch), s_i (monomer entropy), and ε_‡ (Arrhenius barrier) as independent trainable scalars. The chain position model replaces all three with a physically grounded representation: each titratable residue has a **position x_i ∈ [0, 1]** along the polymer backbone, from which φ_ij, ΔS_ij, and k0_ij all emerge as functions of the sequence separation d_ij = |x_i − x_j| · L_chain.
+The standard model treats φ (steric mismatch), s_i (monomer entropy), and ε_‡ (Arrhenius barrier) as independent trainable scalars. The chain position model replaces all three with a physically grounded representation: each titratable residue has a **position x_i ∈ [0, 1]** along the polymer backbone, from which ΔS_ij and k0_ij emerge as functions of the sequence separation d_ij = |x_i − x_j| · L_chain.
 
-This is justified by three classical polymer physics results:
+This is a **mean-field 3D Gaussian chain** model: φ_ij = 1 for all pairs (native and non-native alike), so discrimination between correct and incorrect bonds comes entirely from thermodynamic entropy and kinetics. The (3/2) exponents in both JS entropy and WF kinetics encode averaging over all 3D chain conformations analytically. Selectivity is encoded purely in the **geometry of the trained sequence**: native pairs are placed close (low entropy cost, fast association), non-native pairs are spread far apart (high entropy cost, slow association).
+
+This is justified by two classical polymer physics results:
 
 1. **Jacobson–Stockmayer (1950) loop-closure entropy**: Closing a loop of L residues costs ΔS = (3/2) kB ln(L/l₀) in conformational entropy. Longer loops are harder to close. This generates a per-pair entropy penalty that replaces the scalar s_i.
 
 2. **Wilemski–Fixman (1974) / Szabo–Schulten–Schulten (1980) contact rates**: For an ideal Gaussian chain, the rate at which two residues come within contact distance scales as k ∝ L^(−3/2), where L is the sequence separation. Distant residues diffuse slowly toward each other. This generates a position-dependent rate prefactor k0_ij that replaces the scalar k0.
-
-3. **Proximity-based contact selectivity**: Pairs that are close on the chain encounter each other more frequently even when forming wrong bonds. This generates a position-dependent non-native selectivity φ_ij = φ0 · exp(−d_ij/λ_c) that replaces the scalar φ.
 
 ### Derived quantities
 
@@ -353,25 +353,24 @@ From positions x ∈ [0, 1]^{2N} and chain length L_chain (residues):
 ```
 d_ij         = |x_i − x_j| · L_chain + ε_d       (sequence separation, residues)
 
-φ_ij         = 1                                   (native pairs: correct_mask = True)
-             = φ₀ · exp(−d_ij / λ_c)              (non-native pairs)
+φ_ij         = 1                                   (all pairs — mean-field Gaussian chain)
 
 ΔS_ij        = (3/2) · ln(d_ij / l₀)             (loop-closure entropy, kT)
 
 k0_ij        = k₀ · (d₀ / d_ij)^α                (Wilemski–Fixman rate prefactor)
 ```
 
-The free energy becomes ΔG_ij = J · q_i · q_j · φ_ij + ΔS_ij. All quantities are differentiable with respect to x_i through JAX autodiff — gradients flow from the ODE loss back through the chain geometry.
+The free energy becomes ΔG_ij = J · q_i · q_j + ΔS_ij. All quantities are differentiable with respect to x_i through JAX autodiff — gradients flow from the ODE loss back through the chain geometry.
 
 ### What the optimiser learns
 
-Training finds residue positions x that satisfy an "anti-Go" architecture: native classifier pairs are placed **close** on the chain (low entropy penalty, fast association rate, selective: φ_ij = 1 by definition), while competitor pairs are placed at **intermediate** distances that maximise landscape roughness. This recapitulates the sequence design principles of intrinsically disordered proteins (IDPs) that function through charge-pattern-dependent phase separation, as quantified by the κ parameter of Das & Pappu (2013).
+Training finds residue positions x satisfying an "anti-Go" architecture: native classifier pairs are placed **close** on the chain (low entropy penalty, fast association rate) while non-native pairs are spread to **larger separations** (high entropy cost, slow association). This creates a position-encoded energy landscape: the correct bond is thermodynamically and kinetically favoured purely through chain geometry.
 
-The **Zwanzig landscape roughness** σ² = Var[φ_ij · J · q_i · q_j] over non-native pairs provides kinetic memory: ⟨k⟩ ~ k₀ · exp(−β²σ²/2) slows diffusion through the wrong-bond landscape exponentially in J². This roughness **emerges from the trained chain geometry** — no additional free parameters.
+The **Zwanzig landscape roughness** σ² = Var[J · q_i · q_j + ΔS_ij(d)] over non-native pairs provides kinetic memory, with contributions from both charge disorder (J·q·q) and entropy spread (ΔS_ij). This roughness **emerges from the trained chain geometry** — no additional free parameters.
 
 ### Usage
 
-Chain position mode requires `--start_equil` (the Boltzmann equilibrium initial condition is unaffected by chain kinetics and avoids slow ODE equilibration at large ε_‡-equivalent barriers). It is incompatible with `--optimizer hybrid`.
+Chain position mode requires `--start_equil` (the Boltzmann equilibrium initial condition avoids slow ODE equilibration). It is incompatible with `--optimizer hybrid` but supports `--n_restarts` with full parallel execution.
 
 ```bash
 # Basic chain position training
@@ -379,10 +378,15 @@ python main.py --chain_positions --start_equil \
   --N 4 --M 2 --n_epochs 300 --J_max 5.0 \
   --target_pH 9 5 7
 
+# With multiple restarts (parallel)
+python main.py --chain_positions --start_equil \
+  --N 3 --M 1 --n_epochs 150 --J_max 30.0 \
+  --target_pH 9 5 --post_duration 100 --n_restarts 8
+
 # With custom chain parameters
 python main.py --chain_positions --start_equil \
   --N 6 --M 3 --n_epochs 400 --J_max 5.0 \
-  --L_chain 150 --lambda_c 25 --l0 4 --d0 4 --phi0 0.8 \
+  --L_chain 150 --l0 4 --d0 4 \
   --target_pH 9 5 7 --outdir results/chain
 
 # Reload and visualise saved chain mode results
@@ -393,12 +397,10 @@ python main.py --mode animate --outdir results/chain
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--chain_positions` | off | Enable chain position model. Trains 2N residue positions x_i ∈ [0,1] instead of scalar φ, s_i, ε_‡. |
+| `--chain_positions` | off | Enable chain position model. Trains 2N residue positions x_i ∈ [0,1] instead of scalar φ, s_i, ε_‡. φ_ij = 1 for all pairs. |
 | `--L_chain` | `100.0` | Total chain length (residues). Absolute separation d_ij = \|x_i−x_j\| × L_chain. |
-| `--lambda_c` | `20.0` | Contact locality scale λ_c (residues). Non-native φ_ij decays as exp(−d/λ_c). Pairs beyond ~3λ_c are essentially non-interacting. |
 | `--l0` | `3.0` | Entropy reference separation l₀ (residues). ΔS_ij = 0 at d_ij = l₀ (≈1 Kuhn length for an IDP). |
 | `--d0` | `3.0` | Rate reference separation d₀ (residues). k0_ij = k₀ at d_ij = d₀. |
-| `--phi0` | `1.0` | Maximum non-native contact strength at the shortest separation. |
 | `--chain_alpha` | `1.5` | Wilemski–Fixman exponent α for k0_ij ∝ d_ij^{−α}. α = 1.5: Gaussian chain; α = 1.76: self-avoiding chain (good solvent). |
 
 ### Saved output in chain mode
@@ -408,20 +410,25 @@ python main.py --mode animate --outdir results/chain
 ```json
 {
   "pKa": [...],
-  "phi": 0.12,       
-  "J": 4.3,
+  "phi": 1.0,
+  "J": 10.4,
   "x": [0.08, 0.12, 0.31, 0.44, 0.56, 0.68, 0.82, 0.91],
+  "x_residues": [8.0, 12.0, 31.0, 44.0, 56.0, 68.0, 82.0, 91.0],
   "chain_mode": true,
   "L_chain": 100.0,
-  "lambda_c": 20.0,
   "l0": 3.0,
   "d0": 3.0,
-  "phi0": 1.0,
-  "chain_alpha": 1.5
+  "chain_alpha": 1.5,
+  "chain_eps_d": 0.5
 }
 ```
 
-`phi` in the JSON is the **mean non-native selectivity** (for reporting), not a trainable scalar. The matrices φ_ij, ΔS_ij, k0_ij are recomputed from `x` and chain hyperparameters at load time.
+`phi` is always 1.0 in chain mode (by construction). `x_residues` gives the positions in physical units (residues) for convenience. The matrices ΔS_ij, k0_ij are recomputed from `x` and chain hyperparameters at load time.
+
+### `summary.png` in chain mode
+
+- The top-right panel shows **J evolution** only (φ ≡ 1 is noted in the title).
+- A new **residue position evolution** panel shows all 2N positions x_i(epoch) during training, colour-coded identically to the pKa panel (classifier acids = thick red, roughness acids = thin orange, classifier bases = thick blue, roughness bases = thin cyan).
 
 ---
 
@@ -434,7 +441,7 @@ CRN_AD/
 │   │                     boltzmann_equilibrium_jax (differentiable), boltzmann_initial_state
 │   ├── dynamics.py       ODE system (Diffrax Tsit5), simulate_schedule, lax.scan
 │   ├── chain_physics.py  Chain position model: Jacobson–Stockmayer entropy,
-│   │                     Wilemski–Fixman k0_ij, proximity-based φ_ij (differentiable)
+│   │                     Wilemski–Fixman k0_ij (differentiable); φ_ij = 1 always
 │   ├── training.py       InfoNCE loss, constrain_params, train(), train_cmaes_hybrid()
 │   └── visualize.py      plot_summary(), animate_crn(), _mn_particle_labels/style
 ├── main.py               CLI (train / eval / animate / csv modes), export_csv()

@@ -428,6 +428,7 @@ def plot_summary(loss_history, score_history, param_history,
     S_max           = float(static.get('S_max', 0.0))
     sw              = float(static.get('smooth_width', 0.0))
     J_max           = float(static.get('J_max', 3.5))
+    _chain_mode     = bool(static.get('chain_mode', False))
 
     has_entropy = (S_max > 0.0 and 'monomer_entropy' in trained_params
                    and trained_params['monomer_entropy'] is not None)
@@ -438,10 +439,20 @@ def plot_summary(loss_history, score_history, param_history,
     phi_hist   = np.array([p['phi'] for p in param_history])
     J_hist     = np.array([float(np.mean(np.array(p['J']))) if np.ndim(np.array(p['J'])) > 0
                            else float(p['J']) for p in param_history])
+    if _chain_mode:
+        x_hist = np.array([p['x'] for p in param_history if 'x' in p])
+    else:
+        x_hist = None
+    _has_pos_panel = _chain_mode and x_hist is not None and len(x_hist) > 0
 
-    n_rows       = 4 if has_entropy else 3
-    h_ratios     = ([1.0, 2.5, 1.2, 1.2] if has_entropy
-                    else [1.0, 2.5, 1.2])
+    if has_entropy and _has_pos_panel:
+        n_rows, h_ratios = 5, [1.0, 2.5, 1.2, 1.2, 1.2]
+    elif has_entropy:
+        n_rows, h_ratios = 4, [1.0, 2.5, 1.2, 1.2]
+    elif _has_pos_panel:
+        n_rows, h_ratios = 4, [1.0, 2.5, 1.2, 1.2]
+    else:
+        n_rows, h_ratios = 3, [1.0, 2.5, 1.2]
     fig_h        = sum(h_ratios) * 3.2
 
     fig = plt.figure(figsize=(20, fig_h))
@@ -455,13 +466,18 @@ def plot_summary(loss_history, score_history, param_history,
     ax_phiJ = fig.add_subplot(gs[0, 2])
     ax_conc = fig.add_subplot(gs[1, 0:2])
     ax_dG   = fig.add_subplot(gs[1, 2])
+    _ent_row = None
     if has_entropy:
-        ax_ent    = fig.add_subplot(gs[2, 0:2])
-        ax_params = fig.add_subplot(gs[2, 2])
-        ax_bar    = fig.add_subplot(gs[3, 0:3])
+        ax_ent   = fig.add_subplot(gs[2, 0:2])
+        _ent_row = 2
+    _next = (_ent_row + 1) if _ent_row is not None else 2
+    if _has_pos_panel:
+        ax_pos    = fig.add_subplot(gs[_next, 0:2])
+        ax_params = fig.add_subplot(gs[_next, 2])
+        ax_bar    = fig.add_subplot(gs[_next + 1, 0:3])
     else:
-        ax_params = fig.add_subplot(gs[2, 2])
-        ax_bar    = fig.add_subplot(gs[2, 0:2])
+        ax_params = fig.add_subplot(gs[_next, 2])
+        ax_bar    = fig.add_subplot(gs[_next, 0:2])
 
     ls_cycle = ['-', '--', '-.', ':', (0, (3, 1, 1, 1))]
 
@@ -502,15 +518,22 @@ def plot_summary(loss_history, score_history, param_history,
     ax_pka.grid(alpha=0.25)
 
     # -------------------------------------------------------------------
-    # Panel 3 — φ and J evolution
+    # Panel 3 — J evolution (+ φ when NOT in chain mode)
     # -------------------------------------------------------------------
-    _fixed_J_plot  = static.get('fixed_J')
+    _fixed_J_plot   = static.get('fixed_J')
     _fixed_phi_plot = static.get('fixed_phi')
-    ax_phiJ.plot(epochs, phi_hist, color='#2980b9', linewidth=2, label='φ (steric)')
-    ax_phiJ.set_ylim(0, 1.05)
+    if not _chain_mode:
+        ax_phiJ.plot(epochs, phi_hist, color='#2980b9', linewidth=2, label='φ (steric)')
+        ax_phiJ.set_ylim(0, 1.05)
+        ax_phiJ.set_ylabel('φ', color='#2980b9', fontsize=11)
+        ax_phiJ.tick_params(axis='y', labelcolor='#2980b9')
+        ax_phiJ.set_title('φ and J evolution', fontsize=12)
+        h1, l1 = ax_phiJ.get_legend_handles_labels()
+    else:
+        ax_phiJ.set_title('J evolution  (φ ≡ 1, chain mode)', fontsize=12)
+        ax_phiJ.set_yticks([])
+        h1, l1 = [], []
     ax_phiJ.set_xlabel('Epoch', fontsize=11)
-    ax_phiJ.set_ylabel('φ', color='#2980b9', fontsize=11)
-    ax_phiJ.tick_params(axis='y', labelcolor='#2980b9')
     ax2 = ax_phiJ.twinx()
     j_lbl = 'mean J (kT)' if J is None else 'J (kT)'
     ax2.plot(epochs, J_hist, color='#c0392b', linewidth=2, label=j_lbl)
@@ -524,11 +547,26 @@ def plot_summary(loss_history, score_history, param_history,
         ax2.set_ylim(0, J_max * 1.08)
     ax2.set_ylabel(j_axis_lbl, color='#c0392b', fontsize=11)
     ax2.tick_params(axis='y', labelcolor='#c0392b')
-    ax_phiJ.set_title('φ and J evolution', fontsize=12)
-    h1, l1 = ax_phiJ.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     ax_phiJ.legend(h1 + h2, l1 + l2, fontsize=9, loc='best')
     ax_phiJ.grid(alpha=0.25)
+
+    # -------------------------------------------------------------------
+    # Panel 3b — Residue position evolution (chain mode only)
+    # -------------------------------------------------------------------
+    if _has_pos_panel:
+        pos_epochs = np.arange(len(x_hist))
+        for i in range(x_hist.shape[1]):
+            col, ls, lw = _mn_particle_style(i, _N_total_ps, _M_clf_ps)
+            ax_pos.plot(pos_epochs, x_hist[:, i],
+                        color=col, linestyle=ls, linewidth=lw,
+                        label=plabels[i] if i < len(plabels) else f'p{i}')
+        ax_pos.set_ylim(-0.02, 1.02)
+        ax_pos.set_xlabel('Epoch', fontsize=11)
+        ax_pos.set_ylabel('x_i  (normalised chain position)', fontsize=11)
+        ax_pos.set_title('Residue position evolution  (chain mode)', fontsize=12)
+        ax_pos.legend(fontsize=8, loc='best', ncol=max(1, x_hist.shape[1] // 4))
+        ax_pos.grid(alpha=0.25)
 
     # -------------------------------------------------------------------
     # Panel 4 — Concentration time series with pH overlay
@@ -863,8 +901,14 @@ def plot_summary(loss_history, score_history, param_history,
         role = 'base' if acid_base[i] == 1 else 'acid'
         tag  = '  [fixed]' if _fpK is not None else ''
         lines.append(f'   pKa {_mn_lbls_tbl[i]:<4} ({role})  {float(_pKa_np[i]):.4f}{tag}')
-    lines.append(f'   phi         {_phi_val:.4f}'
-                 + ('  [fixed]' if _fp is not None else ''))
+    if _chain_mode:
+        lines.append(f'   phi         1.0000  [chain mode: φ≡1]')
+        lines.append(f'   L_chain     {static.get("L_chain", "—")}  residues')
+        lines.append(f'   l0 / d0     {static.get("l0","—")} / {static.get("d0","—")}  residues')
+        lines.append(f'   chain_α     {static.get("chain_alpha","—")}')
+    else:
+        lines.append(f'   phi         {_phi_val:.4f}'
+                     + ('  [fixed]' if _fp is not None else ''))
     lines.append(f'   J           {_J_val:.4f}  kT'
                  + ('  [fixed]' if _fJ is not None else ''))
     lines += [
