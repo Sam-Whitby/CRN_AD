@@ -225,6 +225,38 @@ def build_parser():
     p.add_argument('--lbfgs_epochs', type=int, default=100,
                    help='Maximum L-BFGS-B iterations per restart for --optimizer hybrid.  '
                         'Final polish uses max(lbfgs_epochs, 200) iterations.  Default 100.')
+    # ---- Chain position model (Phase 1 + 2) ----
+    p.add_argument('--chain_positions', action='store_true',
+                   help='Enable chain-position model: train residue positions x_i ∈ [0,1] '
+                        'along the polymer backbone instead of scalar φ, s_i, ε_‡.  '
+                        'Contact selectivity φ_ij, loop-closure entropy ΔS_ij, and rate '
+                        'prefactor k0_ij are all derived from |x_i − x_j| via '
+                        'Jacobson–Stockmayer and Wilemski–Fixman theory.  Requires '
+                        '--start_equil for efficient training (Boltzmann equil unaffected '
+                        'by chain kinetics).  Incompatible with --optimizer hybrid.')
+    p.add_argument('--L_chain', type=float, default=100.0,
+                   help='(--chain_positions) Total chain length in residues. '
+                        'Positions x_i ∈ [0,1] map to absolute distances via '
+                        'd_ij = |x_i−x_j| × L_chain.  Default: 100.')
+    p.add_argument('--lambda_c', type=float, default=20.0,
+                   help='(--chain_positions) Contact locality scale λ_c (residues).  '
+                        'Non-native phi decays as exp(−d/λ_c).  Pairs beyond ~3λ_c '
+                        'have negligible non-native interaction.  Default: 20.')
+    p.add_argument('--l0', type=float, default=3.0,
+                   help='(--chain_positions) Entropy reference separation l0 (residues). '
+                        'Loop-closure entropy ΔS_ij = (3/2) ln(d_ij/l0) is zero at '
+                        'd_ij = l0 (≈ 1 Kuhn length, ~3 residues for an IDP).  Default: 3.')
+    p.add_argument('--d0', type=float, default=3.0,
+                   help='(--chain_positions) Rate-prefactor reference separation d0 (residues).  '
+                        'k0_ij = k0 × (d0/d_ij)^α equals k0 at d_ij = d0.  Default: 3.')
+    p.add_argument('--phi0', type=float, default=1.0,
+                   help='(--chain_positions) Maximum non-native contact strength phi0 '
+                        '(at the shortest possible separation d ≈ chain_eps_d).  '
+                        'Analogous to the scalar φ upper bound.  Default: 1.0.')
+    p.add_argument('--chain_alpha', type=float, default=1.5,
+                   help='(--chain_positions) Rouse/Wilemski–Fixman exponent α for '
+                        'k0_ij ∝ d_ij^{−α}.  α=1.5 (Gaussian chain), α=1.76 '
+                        '(self-avoiding chain in good solvent).  Default: 1.5.')
     # ---- Eval mode: specify all parameters explicitly ----
     p.add_argument('--eval_pKa', nargs='+', type=float, default=None,
                    help='(--mode eval) pKa values, one per species.')
@@ -353,35 +385,59 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
     Returns (equil_traj, schedule_trajs, final_state, post_traj).
     post_traj is None when post_duration == 0.
     """
-    from crn_ad.physics import boltzmann_initial_state as _bis
+    from crn_ad.physics import (boltzmann_initial_state as _bis,
+                                 boltzmann_equilibrium_jax as _beq)
     n             = static['n']
     allowed_mask  = static.get('allowed_mask', None)
     no_self_bonds = bool(static.get('no_self_bonds', False))
-    mono_s        = _get_mono(p, static)
     post_duration = float(static.get('post_duration', 0.0))
     n_pts_post    = int(static.get('n_points_post', max(20, int(2 * post_duration))))
 
-    pKa_full = jnp.array(p['pKa'])
-    eps_b    = float(p.get('eps_barrier', 0.0) or 0.0)
+    pKa_full    = jnp.array(p['pKa'])
+    eps_b       = float(p.get('eps_barrier', 0.0) or 0.0)
+    _chain_mode = bool(static.get('chain_mode', False))
+
+    if _chain_mode:
+        _phi   = jnp.array(p['phi_matrix'])
+        _k0    = jnp.array(p['k0_matrix'])
+        _pe    = jnp.array(p['pair_entropy'])
+        mono_s = None
+    else:
+        _phi   = jnp.array(p['phi'])
+        _k0    = static['k0']
+        _pe    = None
+        mono_s = _get_mono(p, static)
 
     if static.get('start_equil', False):
-        equil_final = jnp.array(_bis(
-            7.0, np.array(p['pKa']),
-            static['acid_base_np'], static['correct_mask_np'],
-            float(p['phi']), p['J'], static['beta'], n,
-            static['i_idx'], static['j_idx'],
-            monomer_entropy_np=(np.array(p['monomer_entropy'])
-                                if p.get('monomer_entropy') is not None else None),
-            no_self_bonds=no_self_bonds,
-        ))
+        if _chain_mode:
+            equil_final = _beq(
+                pKa_full, _phi, jnp.array(p['J']), 7.0,
+                static['acid_base'], static['correct_mask'],
+                static['beta'], n,
+                static['i_idx'], static['j_idx'],
+                monomer_entropy=None,
+                allowed_mask=allowed_mask,
+                no_self_bonds=no_self_bonds,
+                pair_entropy=_pe,
+            )
+        else:
+            equil_final = jnp.array(_bis(
+                7.0, np.array(p['pKa']),
+                static['acid_base_np'], static['correct_mask_np'],
+                float(p['phi']), p['J'], static['beta'], n,
+                static['i_idx'], static['j_idx'],
+                monomer_entropy_np=(np.array(p['monomer_entropy'])
+                                    if p.get('monomer_entropy') is not None else None),
+                no_self_bonds=no_self_bonds,
+            ))
         equil_traj_data = np.array(equil_final)[np.newaxis, :]
     else:
         equil_ramp = float(static.get('equil_ramp_duration', 0.0))
         equil_final, equil_traj = simulate_schedule(
             make_initial_state(n), [7.0], static['equil_duration'],
             pKa_full, static['acid_base'],
-            jnp.array(p['phi']), jnp.array(p['J']),
-            static['beta'], static['k0'],
+            _phi, jnp.array(p['J']),
+            static['beta'], _k0,
             static['correct_mask'], n, static['i_idx'], static['j_idx'],
             n_points=static['n_points_equil'],
             monomer_entropy=mono_s,
@@ -389,34 +445,37 @@ def get_equil_and_schedule_traj(p, static, target_sched, duration):
             beta_ramp_duration=equil_ramp,
             no_self_bonds=no_self_bonds,
             eps_barrier=eps_b,
+            pair_entropy=_pe,
         )
         equil_traj_data = np.array(equil_traj[0])
 
     final_state, schedule_trajs = simulate_schedule(
         equil_final, target_sched, duration,
         pKa_full, static['acid_base'],
-        jnp.array(p['phi']), jnp.array(p['J']),
-        static['beta'], static['k0'],
+        _phi, jnp.array(p['J']),
+        static['beta'], _k0,
         static['correct_mask'], n, static['i_idx'], static['j_idx'],
         n_points=static['n_points_equil'],
         monomer_entropy=mono_s,
         allowed_mask=allowed_mask,
         no_self_bonds=no_self_bonds,
         eps_barrier=eps_b,
+        pair_entropy=_pe,
     )
 
     if post_duration > 0:
         _, post_traj_list = simulate_schedule(
             final_state, [7.0], post_duration,
             pKa_full, static['acid_base'],
-            jnp.array(p['phi']), jnp.array(p['J']),
-            static['beta'], static['k0'],
+            _phi, jnp.array(p['J']),
+            static['beta'], _k0,
             static['correct_mask'], n, static['i_idx'], static['j_idx'],
             n_points=n_pts_post,
             monomer_entropy=mono_s,
             allowed_mask=allowed_mask,
             no_self_bonds=no_self_bonds,
             eps_barrier=eps_b,
+            pair_entropy=_pe,
         )
         post_traj = np.array(post_traj_list[0])
     else:
@@ -431,6 +490,31 @@ def _get_mono(p, static):
     if s is None or static.get('S_max', 0.0) == 0.0:
         return None
     return jnp.atleast_1d(jnp.array(s))
+
+
+def _resolve_chain_params(p, static):
+    """Reconstruct phi_matrix, pair_entropy, k0_matrix from x if in chain mode.
+
+    Called after training (where matrix keys are stripped before saving) and
+    after loading saved params in animate mode.  p must contain 'x' (residue
+    positions); static must contain the chain hyperparameters.
+    """
+    if not static.get('chain_mode', False) or 'phi_matrix' in p:
+        return p
+    from crn_ad.chain_physics import compute_chain_quantities as _ccq
+    x = jnp.array(p['x'])
+    phi_m, ent_m, k0_m = _ccq(
+        x, static['correct_mask'],
+        L_chain  = static['L_chain'],
+        lambda_c = static['lambda_c'],
+        l0       = static['l0'],
+        d0       = static['d0'],
+        k0_base  = static['k0'],
+        phi0     = static.get('phi0', 1.0),
+        alpha    = static.get('chain_alpha', 1.5),
+        eps_d    = static.get('chain_eps_d', 0.5),
+    )
+    return {**p, 'phi_matrix': phi_m, 'pair_entropy': ent_m, 'k0_matrix': k0_m}
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +791,13 @@ def main():
             grad_clip            = args.grad_clip,
             start_equil          = args.start_equil,
             post_duration        = args.post_duration,
+            chain_mode           = args.chain_positions,
+            L_chain              = args.L_chain,
+            lambda_c             = args.lambda_c,
+            l0                   = args.l0,
+            d0                   = args.d0,
+            phi0                 = args.phi0,
+            chain_alpha          = args.chain_alpha,
         )
 
         print('=' * 60)
@@ -783,9 +874,14 @@ def main():
         p_eval = constrain_params(raw_params, J_max=args.J_max, S_max=args.S_max,
                                   eps_max=args.eps_barrier_max,
                                   fixed_phi=args.fixed_phi, fixed_J=args.fixed_J,
-                                  fixed_pKa=_fixed_pKa_eval)
+                                  fixed_pKa=_fixed_pKa_eval,
+                                  chain_mode=args.chain_positions,
+                                  chain_static=static if args.chain_positions else None)
         p_eval = {k: (np.array(v) if hasattr(v, '__len__') else float(v))
-                  for k, v in p_eval.items()}
+                  for k, v in p_eval.items()
+                  if k not in ('phi_matrix', 'pair_entropy', 'k0_matrix')}
+        # Re-attach chain matrices for simulation (not persisted to JSON)
+        p_eval = _resolve_chain_params(p_eval, static)
 
         # Save params
         params_out = {
@@ -808,12 +904,22 @@ def main():
             'pka_default'        : args.pka_default,
             'start_equil'        : args.start_equil,
             'post_duration'      : args.post_duration,
+            'eps_barrier_max'    : args.eps_barrier_max,
         }
         if args.S_max > 0.0 and 'monomer_entropy' in p_eval:
             params_out['monomer_entropy'] = np.atleast_1d(
                 p_eval['monomer_entropy']).tolist()
         if args.eps_barrier_max > 0.0 and p_eval.get('eps_barrier') is not None:
             params_out['eps_barrier'] = float(p_eval['eps_barrier'])
+        if args.chain_positions and 'x' in p_eval:
+            params_out['x']           = np.array(p_eval['x']).tolist()
+            params_out['chain_mode']   = True
+            params_out['L_chain']      = args.L_chain
+            params_out['lambda_c']     = args.lambda_c
+            params_out['l0']           = args.l0
+            params_out['d0']           = args.d0
+            params_out['phi0']         = args.phi0
+            params_out['chain_alpha']  = args.chain_alpha
 
         with open(params_path, 'w') as f:
             json.dump(params_out, f, indent=2)
@@ -836,11 +942,12 @@ def main():
             sys.exit(1)
         with open(params_path) as f:
             pdata = json.load(f)
-        _J_max  = float(pdata.get('J_max', args.J_max))
-        _S_max  = float(pdata.get('S_max', args.S_max))
-        _nsb    = bool(pdata.get('no_self_bonds', False))
-        _N_anim = int(pdata['N_total'])
-        _M_anim = int(pdata['M_classifier'])
+        _J_max      = float(pdata.get('J_max', args.J_max))
+        _S_max      = float(pdata.get('S_max', args.S_max))
+        _nsb        = bool(pdata.get('no_self_bonds', False))
+        _N_anim     = int(pdata['N_total'])
+        _M_anim     = int(pdata['M_classifier'])
+        _chain_anim = bool(pdata.get('chain_mode', False))
         # Load effective durations (k0-multiplied) from params file if present.
         _k0_anim = float(pdata.get('k0', 1.0))
         _anim_equil_dur = float(pdata.get('equil_duration',
@@ -861,6 +968,15 @@ def main():
         _anim_post_dur = float(pdata.get('post_duration', args.post_duration))
         static['post_duration'] = _anim_post_dur
         static['n_points_post'] = max(20, int(2 * _anim_post_dur))
+        if _chain_anim:
+            static['chain_mode']  = True
+            static['L_chain']     = float(pdata.get('L_chain', 100.0))
+            static['lambda_c']    = float(pdata.get('lambda_c', 20.0))
+            static['l0']          = float(pdata.get('l0', 3.0))
+            static['d0']          = float(pdata.get('d0', 3.0))
+            static['phi0']        = float(pdata.get('phi0', 1.0))
+            static['chain_alpha'] = float(pdata.get('chain_alpha', 1.5))
+            static['chain_eps_d'] = float(pdata.get('chain_eps_d', 0.5))
         p_eval = {
             'pKa': np.array(pdata['pKa']),
             'phi': float(pdata['phi']),
@@ -869,6 +985,9 @@ def main():
                                 if 'monomer_entropy' in pdata else None),
             'eps_barrier': float(pdata.get('eps_barrier', 0.0)),
         }
+        if _chain_anim and 'x' in pdata:
+            p_eval['x'] = np.array(pdata['x'])
+        p_eval = _resolve_chain_params(p_eval, static)
         target_sched  = [float(x) for x in pdata['target_pH_schedule']]
         all_schedules = all_unique_permutations(target_sched)
         target_idx    = all_schedules.index(target_sched)

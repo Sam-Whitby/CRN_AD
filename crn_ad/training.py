@@ -37,6 +37,7 @@ from .dynamics import (simulate_schedule, simulate_schedule_scan,
                        make_initial_state, make_triu_indices)
 from .physics import (boltzmann_initial_state as _boltzmann_initial_state,
                        boltzmann_equilibrium_jax as _boltzmann_equilibrium_jax)
+from .chain_physics import compute_chain_quantities as _compute_chain_quantities
 
 
 # ---------------------------------------------------------------------------
@@ -74,32 +75,64 @@ _clip_grad_norm.defvjp(_cgn_fwd, _cgn_bwd)
 # ---------------------------------------------------------------------------
 
 def constrain_params(raw, J_max=3.5, S_max=0.0, eps_max=0.0, fixed_phi=None,
-                     fixed_J=None, fixed_pKa=None):
+                     fixed_J=None, fixed_pKa=None, chain_mode=False,
+                     chain_static=None):
     """
     Map unconstrained (ℝ) raw parameters to physical ranges.
 
-    pKa            ∈ [3, 10]       via 3 + 7·σ(raw)  (or fixed_pKa if not None)
-    phi            ∈ [0, 1]        via σ(raw)          (or fixed_phi if not None)
-    J              ∈ [0.5, J_max]  via 0.5 + (J_max−0.5)·σ(raw)  (or fixed_J if not None)
-    monomer_entropy∈ [0, S_max]    via S_max·σ(raw)   (scalar or n-vector)
-    eps_barrier    ∈ [0, eps_max]  via eps_max·σ(raw)  (only when eps_max > 0)
+    Standard mode:
+      pKa            ∈ [3, 10]       via 3 + 7·σ(raw)
+      phi            ∈ [0, 1]        via σ(raw)
+      J              ∈ [0.5, J_max]  via 0.5 + (J_max−0.5)·σ(raw)
+      monomer_entropy∈ [0, S_max]    via S_max·σ(raw)
+      eps_barrier    ∈ [0, eps_max]  via eps_max·σ(raw)
+
+    Chain position mode (chain_mode=True):
+      x              ∈ [0, 1]^{2N}   via σ(raw['x'])  — residue positions
+      J is still trained; phi/s_i/eps_barrier are all replaced by chain-derived
+      matrices computed from x via Jacobson–Stockmayer and Wilemski–Fixman theory.
+      chain_static must contain the chain hyperparameters (L_chain, lambda_c, …).
     """
     out = {
         'pKa': (jnp.array(fixed_pKa, dtype=float) if fixed_pKa is not None
                 else 3.0 + 7.0 * jax.nn.sigmoid(raw['pKa'])),
-        'phi': (jnp.array(float(fixed_phi)) if fixed_phi is not None
-                else jax.nn.sigmoid(raw['phi'])),
         'J':   (jnp.array(float(fixed_J)) if fixed_J is not None
                 else 0.5 + (J_max - 0.5) * jax.nn.sigmoid(raw['J'])),
     }
-    if S_max > 0.0 and 'monomer_entropy' in raw:
-        out['monomer_entropy'] = S_max * jax.nn.sigmoid(raw['monomer_entropy'])
-    if eps_max > 0.0 and 'eps_barrier' in raw:
-        out['eps_barrier'] = eps_max * jax.nn.sigmoid(raw['eps_barrier'])
+
+    if chain_mode and chain_static is not None:
+        # Positions in [0, 1]; derive phi/entropy/k0 matrices from chain geometry.
+        x = jax.nn.sigmoid(raw['x'])
+        out['x'] = x
+        phi_m, ent_m, k0_m = _compute_chain_quantities(
+            x, chain_static['correct_mask'],
+            L_chain   = chain_static['L_chain'],
+            lambda_c  = chain_static['lambda_c'],
+            l0        = chain_static['l0'],
+            d0        = chain_static['d0'],
+            k0_base   = chain_static['k0'],
+            phi0      = chain_static.get('phi0', 1.0),
+            alpha     = chain_static.get('chain_alpha', 1.5),
+            eps_d     = chain_static.get('chain_eps_d', 0.5),
+        )
+        out['phi_matrix']   = phi_m
+        out['pair_entropy'] = ent_m
+        out['k0_matrix']    = k0_m
+        # Scalar phi for reporting/visualisation (mean non-native selectivity).
+        out['phi'] = jnp.mean(phi_m * ~chain_static['correct_mask'])
+    else:
+        out['phi'] = (jnp.array(float(fixed_phi)) if fixed_phi is not None
+                      else jax.nn.sigmoid(raw['phi']))
+        if S_max > 0.0 and 'monomer_entropy' in raw:
+            out['monomer_entropy'] = S_max * jax.nn.sigmoid(raw['monomer_entropy'])
+        if eps_max > 0.0 and 'eps_barrier' in raw:
+            out['eps_barrier'] = eps_max * jax.nn.sigmoid(raw['eps_barrier'])
+
     return out
 
 
-def unconstrain_params(phys, J_max=3.5, S_max=0.0, eps_max=0.0):
+def unconstrain_params(phys, J_max=3.5, S_max=0.0, eps_max=0.0,
+                       chain_mode=False):
     """Inverse of constrain_params for warm-starting."""
     def _logit(x):
         x = jnp.clip(jnp.array(x), 1e-4, 1 - 1e-4)
@@ -109,15 +142,20 @@ def unconstrain_params(phys, J_max=3.5, S_max=0.0, eps_max=0.0):
     J_norm   = jnp.clip((jnp.array(phys['J']) - 0.5) / (J_max - 0.5), 1e-4, 1 - 1e-4)
     out = {
         'pKa': jnp.log(pKa_norm / (1 - pKa_norm)),
-        'phi': _logit(phys['phi']),
         'J':   jnp.log(J_norm   / (1 - J_norm)),
     }
-    if S_max > 0.0 and 'monomer_entropy' in phys:
-        s_norm = jnp.clip(jnp.array(phys['monomer_entropy']) / S_max, 1e-4, 1 - 1e-4)
-        out['monomer_entropy'] = jnp.log(s_norm / (1 - s_norm))
-    if eps_max > 0.0 and 'eps_barrier' in phys:
-        eb_norm = jnp.clip(jnp.array(phys['eps_barrier']) / eps_max, 1e-4, 1 - 1e-4)
-        out['eps_barrier'] = jnp.log(eb_norm / (1 - eb_norm))
+    if chain_mode:
+        if 'x' in phys:
+            out['x'] = _logit(jnp.array(phys['x']))
+        # phi/entropy/eps_barrier not in raw params for chain mode
+    else:
+        out['phi'] = _logit(phys['phi'])
+        if S_max > 0.0 and 'monomer_entropy' in phys:
+            s_norm = jnp.clip(jnp.array(phys['monomer_entropy']) / S_max, 1e-4, 1 - 1e-4)
+            out['monomer_entropy'] = jnp.log(s_norm / (1 - s_norm))
+        if eps_max > 0.0 and 'eps_barrier' in phys:
+            eb_norm = jnp.clip(jnp.array(phys['eps_barrier']) / eps_max, 1e-4, 1 - 1e-4)
+            out['eps_barrier'] = jnp.log(eb_norm / (1 - eb_norm))
     return out
 
 
@@ -246,42 +284,53 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
     under the target schedule and penalised for folding at pH 7 or under
     any permutation.
     """
+    _chain_mode  = bool(static.get('chain_mode', False))
     p = constrain_params(raw_params,
                          J_max=static['J_max'],
                          S_max=static.get('S_max', 0.0),
                          eps_max=static.get('eps_barrier_max', 0.0),
                          fixed_phi=static.get('fixed_phi'),
                          fixed_J=static.get('fixed_J'),
-                         fixed_pKa=static.get('fixed_pKa'))
-    mono_s       = _get_monomer_entropy(p)
+                         fixed_pKa=static.get('fixed_pKa'),
+                         chain_mode=_chain_mode,
+                         chain_static=static if _chain_mode else None)
+
+    # Resolve phi, k0, entropy, pair_entropy for this mode.
+    if _chain_mode:
+        _phi     = p['phi_matrix']    # (n, n)
+        _k0      = p['k0_matrix']     # (n, n)
+        _pe      = p['pair_entropy']  # (n, n)
+        mono_s   = None
+    else:
+        _phi     = p['phi']           # scalar
+        _k0      = static['k0']       # scalar
+        _pe      = None
+        mono_s   = _get_monomer_entropy(p)
+
     sw              = float(static.get('smooth_width', 0.0))
     allowed_mask    = static.get('allowed_mask', None)
     no_self_bonds   = bool(static.get('no_self_bonds', False))
     equil_ramp      = float(static.get('equil_ramp_duration', 0.0))
     grad_clip    = static.get('grad_clip', None)
     eps_b        = p.get('eps_barrier', jnp.array(0.0))
-    # pKa array already has one value per particle (2*N_acids elements)
     pKa_full = p['pKa']
 
-    # Score is computed from the FINAL state after the full schedule —
-    # equil gives the starting state, then each permutation is run to completion.
     if static.get('start_equil', False):
-        # Differentiable Boltzmann equilibrium via unrolled JAX fixed-point.
-        # Gradients flow through pKa/phi/J → equilibrium state → ODE → loss.
         equil_state = _boltzmann_equilibrium_jax(
-            pKa_full, p['phi'], p['J'], 7.0,
+            pKa_full, _phi, p['J'], 7.0,
             static['acid_base'], static['correct_mask'],
             static['beta'], static['n'],
             static['i_idx'], static['j_idx'],
             monomer_entropy=mono_s,
             allowed_mask=allowed_mask,
             no_self_bonds=no_self_bonds,
+            pair_entropy=_pe,
         )
     else:
         equil_state = simulate_schedule_scan(
             initial_state, jnp.array([7.0]), static['equil_duration'],
-            pKa_full, static['acid_base'], p['phi'], p['J'],
-            static['beta'], static['k0'],
+            pKa_full, static['acid_base'], _phi, p['J'],
+            static['beta'], _k0,
             static['correct_mask'], static['n'],
             static['i_idx'], static['j_idx'],
             n_points=static['n_points_equil'],
@@ -292,27 +341,24 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
             beta_ramp_duration=equil_ramp,
             no_self_bonds=no_self_bonds,
             eps_barrier=eps_b,
+            pair_entropy=_pe,
         )
-        # Clip gradient norm flowing back through the equil ODE adjoint.
         if grad_clip is not None:
             equil_state = _clip_grad_norm(float(grad_clip), equil_state)
 
-    # Baseline: correct-bond fraction at the pH-7 equilibrium state, before
-    # any schedule is applied.  Gradients flow back through this score so
-    # the optimiser is penalised for forming correct dimers at pH 7.
     baseline_score = correct_bond_score(equil_state, static['n'],
                                         static['correct_triu_idx'])
 
     _post_dur    = float(static.get('post_duration', 0.0))
     _n_pts_post  = int(static.get('n_points_post', 20))
-    _n_segs      = int(all_pH_schedules_array.shape[1])  # pH steps per schedule
+    _n_segs      = int(all_pH_schedules_array.shape[1])
 
     def score_one(pH_sched):
         if _post_dur > 0.0:
             final, all_trajs = simulate_schedule_scan(
                 equil_state, pH_sched, duration_per_seg,
-                pKa_full, static['acid_base'], p['phi'], p['J'],
-                static['beta'], static['k0'],
+                pKa_full, static['acid_base'], _phi, p['J'],
+                static['beta'], _k0,
                 static['correct_mask'], static['n'],
                 static['i_idx'], static['j_idx'],
                 n_points=static['n_points_sim'],
@@ -323,13 +369,14 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                 no_self_bonds=no_self_bonds,
                 return_traj=True,
                 eps_barrier=eps_b,
+                pair_entropy=_pe,
             )
             if grad_clip is not None:
                 final = _clip_grad_norm(float(grad_clip), final)
             _, post_trajs = simulate_schedule_scan(
                 final, jnp.array([7.0]), _post_dur,
-                pKa_full, static['acid_base'], p['phi'], p['J'],
-                static['beta'], static['k0'],
+                pKa_full, static['acid_base'], _phi, p['J'],
+                static['beta'], _k0,
                 static['correct_mask'], static['n'],
                 static['i_idx'], static['j_idx'],
                 n_points=_n_pts_post,
@@ -340,8 +387,9 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                 no_self_bonds=no_self_bonds,
                 return_traj=True,
                 eps_barrier=eps_b,
+                pair_entropy=_pe,
             )
-            post_traj = post_trajs[0]   # (n_pts_post, state_size)
+            post_traj = post_trajs[0]
             return integral_bond_score(
                 all_trajs, post_traj,
                 float(_n_segs) * duration_per_seg, _post_dur,
@@ -350,8 +398,8 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
         else:
             final = simulate_schedule_scan(
                 equil_state, pH_sched, duration_per_seg,
-                pKa_full, static['acid_base'], p['phi'], p['J'],
-                static['beta'], static['k0'],
+                pKa_full, static['acid_base'], _phi, p['J'],
+                static['beta'], _k0,
                 static['correct_mask'], static['n'],
                 static['i_idx'], static['j_idx'],
                 n_points=static['n_points_sim'],
@@ -361,6 +409,7 @@ def compute_loss(raw_params, all_pH_schedules_array, target_idx,
                 allowed_mask=allowed_mask,
                 no_self_bonds=no_self_bonds,
                 eps_barrier=eps_b,
+                pair_entropy=_pe,
             )
             if grad_clip is not None:
                 final = _clip_grad_norm(float(grad_clip), final)
@@ -401,17 +450,27 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
 
     Compiles on first call; subsequent calls with same shapes are cached.
     """
+    _chain_mode   = bool(static.get('chain_mode', False))
     all_pH_array  = jnp.array(all_schedules, dtype=float)
     sw            = float(static.get('smooth_width', 0.0))
     allowed_mask  = static.get('allowed_mask', None)
     no_self_bonds = bool(static.get('no_self_bonds', False))
-    pKa          = jnp.array(p_constrained['pKa'])  # already 2*N_acids values
-    phi          = jnp.array(p_constrained['phi'])
-    J            = jnp.array(p_constrained['J'])
-    mono_s = (_get_monomer_entropy(p_constrained)
-              if p_constrained.get('monomer_entropy') is not None else None)
-    equil_ramp = float(static.get('equil_ramp_duration', 0.0))
-    eps_b_fast = float(p_constrained.get('eps_barrier', 0.0) or 0.0)
+    pKa           = jnp.array(p_constrained['pKa'])
+    J             = jnp.array(p_constrained['J'])
+    equil_ramp    = float(static.get('equil_ramp_duration', 0.0))
+    eps_b_fast    = float(p_constrained.get('eps_barrier', 0.0) or 0.0)
+
+    if _chain_mode:
+        _phi_f   = jnp.array(p_constrained['phi_matrix'])
+        _k0_f    = jnp.array(p_constrained['k0_matrix'])
+        _pe_f    = jnp.array(p_constrained['pair_entropy'])
+        mono_s   = None
+    else:
+        _phi_f   = jnp.array(p_constrained['phi'])
+        _k0_f    = static['k0']
+        _pe_f    = None
+        mono_s   = (_get_monomer_entropy(p_constrained)
+                    if p_constrained.get('monomer_entropy') is not None else None)
 
     _start_equil  = bool(static.get('start_equil', False))
     _dissoc_state = make_initial_state(static['n'])
@@ -419,24 +478,24 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
     _n_pts_post_f = int(static.get('n_points_post', 20))
     _n_segs_f     = int(all_pH_array.shape[1])
 
-    # JIT-compiled scoring function (traced once, cached by JAX)
     @jax.jit
-    def _score_all(pKa, phi, J, all_pH_array):
+    def _score_all(pKa, _phi, J, _k0, all_pH_array):
         if _start_equil:
             equil = _boltzmann_equilibrium_jax(
-                pKa, phi, J, 7.0,
+                pKa, _phi, J, 7.0,
                 static['acid_base'], static['correct_mask'],
                 static['beta'], static['n'],
                 static['i_idx'], static['j_idx'],
                 monomer_entropy=mono_s,
                 allowed_mask=allowed_mask,
                 no_self_bonds=no_self_bonds,
+                pair_entropy=_pe_f,
             )
         else:
             equil = simulate_schedule_scan(
                 _dissoc_state, jnp.array([7.0]), static['equil_duration'],
-                pKa, static['acid_base'], phi, J,
-                static['beta'], static['k0'],
+                pKa, static['acid_base'], _phi, J,
+                static['beta'], _k0,
                 static['correct_mask'], static['n'],
                 static['i_idx'], static['j_idx'],
                 n_points=static['n_points_equil'],
@@ -447,6 +506,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                 beta_ramp_duration=equil_ramp,
                 no_self_bonds=no_self_bonds,
                 eps_barrier=eps_b_fast,
+                pair_entropy=_pe_f,
             )
 
         baseline = correct_bond_score(equil, static['n'],
@@ -456,8 +516,8 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
             if _post_dur_f > 0.0:
                 final, all_trajs = simulate_schedule_scan(
                     equil, pH_sched, duration_per_seg,
-                    pKa, static['acid_base'], phi, J,
-                    static['beta'], static['k0'],
+                    pKa, static['acid_base'], _phi, J,
+                    static['beta'], _k0,
                     static['correct_mask'], static['n'],
                     static['i_idx'], static['j_idx'],
                     n_points=static['n_points_sim'],
@@ -467,11 +527,12 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                     no_self_bonds=no_self_bonds,
                     return_traj=True,
                     eps_barrier=eps_b_fast,
+                    pair_entropy=_pe_f,
                 )
                 _, post_trajs = simulate_schedule_scan(
                     final, jnp.array([7.0]), _post_dur_f,
-                    pKa, static['acid_base'], phi, J,
-                    static['beta'], static['k0'],
+                    pKa, static['acid_base'], _phi, J,
+                    static['beta'], _k0,
                     static['correct_mask'], static['n'],
                     static['i_idx'], static['j_idx'],
                     n_points=_n_pts_post_f,
@@ -482,6 +543,7 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                     no_self_bonds=no_self_bonds,
                     return_traj=True,
                     eps_barrier=eps_b_fast,
+                    pair_entropy=_pe_f,
                 )
                 post_traj = post_trajs[0]
                 return integral_bond_score(
@@ -492,8 +554,8 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
             else:
                 final = simulate_schedule_scan(
                     equil, pH_sched, duration_per_seg,
-                    pKa, static['acid_base'], phi, J,
-                    static['beta'], static['k0'],
+                    pKa, static['acid_base'], _phi, J,
+                    static['beta'], _k0,
                     static['correct_mask'], static['n'],
                     static['i_idx'], static['j_idx'],
                     n_points=static['n_points_sim'],
@@ -502,13 +564,14 @@ def compute_scores_fast(p_constrained, all_schedules, duration_per_seg, static):
                     allowed_mask=allowed_mask,
                     no_self_bonds=no_self_bonds,
                     eps_barrier=eps_b_fast,
+                    pair_entropy=_pe_f,
                 )
                 return correct_bond_score(final, static['n'], static['correct_triu_idx'])
 
         sched_scores = jax.vmap(score_one)(all_pH_array)
         return jnp.append(sched_scores, baseline)
 
-    return np.array(_score_all(pKa, phi, J, all_pH_array))
+    return np.array(_score_all(pKa, _phi_f, J, _k0_f, all_pH_array))
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +613,7 @@ def train(config):
     smooth         = float(config.get('smooth_width', 0.0))
     per_mono       = bool(config.get('per_monomer_entropy', False))
     no_self_bonds  = bool(config.get('no_self_bonds', False))
+    chain_mode     = bool(config.get('chain_mode', False))
     wide_init      = bool(config.get('wide_init', False))
     j_init_max     = bool(config.get('j_init_max', False))
     phi_init_max   = bool(config.get('phi_init_max', False))
@@ -631,9 +695,16 @@ def train(config):
         'start_equil'        : start_equil,
         'post_duration'      : float(config.get('post_duration', 0.0)),
         'n_points_post'      : max(20, int(2 * float(config.get('post_duration', 0.0)))),
+        # Chain position mode hyperparameters (ignored when chain_mode=False)
+        'chain_mode'         : chain_mode,
+        'L_chain'            : float(config.get('L_chain', 100.0)),
+        'lambda_c'           : float(config.get('lambda_c', 20.0)),
+        'l0'                 : float(config.get('l0', 3.0)),
+        'd0'                 : float(config.get('d0', 3.0)),
+        'phi0'               : float(config.get('phi0', 1.0)),
+        'chain_alpha'        : float(config.get('chain_alpha', 1.5)),
+        'chain_eps_d'        : float(config.get('chain_eps_d', 0.5)),
     }
-    # When starting from Boltzmann equilibrium there is no ODE equil phase;
-    # set equil_duration to 0 so visualisation shows no equil segment.
     if start_equil:
         static['equil_duration'] = 0.0
 
@@ -714,9 +785,20 @@ def train(config):
         'phi': jnp.array(phi_init),
         'J'  : jnp.array(J_init),
     }
-    # Snapshot the true starting params (before any gradient step) for reporting.
     init_phys_np = {k: np.array(v) for k, v in init_phys.items()}
-    if S_max > 0.0:
+    if chain_mode:
+        # Evenly-spaced initial positions: acids in [0, 0.5], bases in [0.5, 1].
+        x_acid_init = np.linspace(0.05, 0.45, N_acids)
+        x_base_init = np.linspace(0.55, 0.95, N_acids)
+        x_init = np.concatenate([x_acid_init, x_base_init])
+        init_phys['x'] = jnp.array(x_init)
+        init_phys_np['x'] = x_init
+        if verbose:
+            print(f"Chain mode   : L_chain={static['L_chain']:.0f} residues, "
+                  f"λ_c={static['lambda_c']:.1f}, l0={static['l0']:.1f}, "
+                  f"d0={static['d0']:.1f}, α={static['chain_alpha']:.2f}")
+            print(f"  (φ, s_i, ε_‡ replaced by {N} trainable positions x_i)")
+    elif S_max > 0.0:
         if wide_init:
             s_init = rng.uniform(0.01 * S_max, 0.5 * S_max, n_entropy)
         else:
@@ -726,14 +808,13 @@ def train(config):
             )
         init_phys['monomer_entropy'] = jnp.array(s_init)
         init_phys_np['monomer_entropy'] = np.array(s_init)
-    if eps_max > 0.0:
-        # Start near zero so early training is close to Metropolis limit.
+    if eps_max > 0.0 and not chain_mode:
         eps_init = eps_max * 0.05
         init_phys['eps_barrier'] = jnp.array(eps_init)
         init_phys_np['eps_barrier'] = float(eps_init)
 
     raw_params = unconstrain_params(init_phys, J_max=J_max, S_max=S_max,
-                                    eps_max=eps_max)
+                                    eps_max=eps_max, chain_mode=chain_mode)
 
     # The fully-dissociated state is passed when start_equil=False.
     # When start_equil=True, compute_loss calls boltzmann_equilibrium_jax
@@ -802,8 +883,9 @@ def train(config):
 
     p0 = constrain_params(raw_params, J_max=J_max, S_max=S_max, eps_max=eps_max,
                           fixed_phi=fixed_phi_val, fixed_J=fixed_J_val,
-                          fixed_pKa=fixed_pKa_val)
-    param_history = [_snapshot(p0, S_max, eps_max)]
+                          fixed_pKa=fixed_pKa_val, chain_mode=chain_mode,
+                          chain_static=static if chain_mode else None)
+    param_history = [_snapshot(p0, S_max, eps_max, chain_mode=chain_mode)]
 
     nan_stopped = False
     for epoch in range(1, n_epochs):
@@ -824,8 +906,10 @@ def train(config):
         score_history.append(np.array(sc))
         p_cur = constrain_params(raw_params, J_max=J_max, S_max=S_max,
                                   eps_max=eps_max, fixed_phi=fixed_phi_val,
-                                  fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val)
-        param_history.append(_snapshot(p_cur, S_max, eps_max))
+                                  fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val,
+                                  chain_mode=chain_mode,
+                                  chain_static=static if chain_mode else None)
+        param_history.append(_snapshot(p_cur, S_max, eps_max, chain_mode=chain_mode))
 
         if verbose and (epoch % max(1, n_epochs // 15) == 0 or epoch == n_epochs - 1):
             pKa_arr    = [float(v) for v in p_cur['pKa']]
@@ -869,26 +953,40 @@ def train(config):
 
     p_final  = constrain_params(raw_params, J_max=J_max, S_max=S_max,
                                eps_max=eps_max, fixed_phi=fixed_phi_val,
-                               fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val)
-    mono_s   = _get_monomer_entropy(p_final)
+                               fixed_J=fixed_J_val, fixed_pKa=fixed_pKa_val,
+                               chain_mode=chain_mode,
+                               chain_static=static if chain_mode else None)
     pKa_full = p_final['pKa']
-    if start_equil:
-        # Numpy fixed-point (no gradient needed for the return value).
-        equil_state = jnp.array(_boltzmann_initial_state(
-            7.0, np.array(pKa_full),
-            static['acid_base_np'], static['correct_mask_np'],
-            float(p_final['phi']), np.array(p_final['J']),
-            static['beta'], N,
-            static['i_idx'], static['j_idx'],
-            monomer_entropy_np=(np.array(mono_s) if mono_s is not None else None),
-            no_self_bonds=no_self_bonds,
-        ))
+
+    if chain_mode:
+        _phi_f  = p_final['phi_matrix']
+        _k0_f   = p_final['k0_matrix']
+        _pe_f   = p_final['pair_entropy']
+        mono_s  = None
     else:
+        _phi_f  = p_final['phi']
+        _k0_f   = static['k0']
+        _pe_f   = None
+        mono_s  = _get_monomer_entropy(p_final)
+
+    # Compute final equilibrium state for return value (no gradients needed).
+    equil_state = _boltzmann_equilibrium_jax(
+        pKa_full, _phi_f, p_final['J'], 7.0,
+        static['acid_base'], static['correct_mask'],
+        static['beta'], N,
+        static['i_idx'], static['j_idx'],
+        monomer_entropy=mono_s,
+        allowed_mask=allowed_mask_jax,
+        no_self_bonds=no_self_bonds,
+        pair_entropy=_pe_f,
+    )
+    if not (start_equil or chain_mode):
+        # For visualisation accuracy, re-run the ODE equil from dissociated state.
         eps_b_final = float(p_final.get('eps_barrier', 0.0) or 0.0)
         equil_state = simulate_schedule_scan(
             initial_state, jnp.array([7.0]), static['equil_duration'],
-            pKa_full, static['acid_base'], p_final['phi'], p_final['J'],
-            static['beta'], static['k0'],
+            pKa_full, static['acid_base'], _phi_f, p_final['J'],
+            static['beta'], _k0_f,
             static['correct_mask'], static['n'], static['i_idx'], static['j_idx'],
             n_points=static['n_points_equil'],
             smooth_width=smooth, monomer_entropy=mono_s, ph_initial=7.0,
@@ -896,6 +994,7 @@ def train(config):
             beta_ramp_duration=static['equil_ramp_duration'],
             no_self_bonds=no_self_bonds,
             eps_barrier=eps_b_final,
+            pair_entropy=_pe_f,
         )
 
     return (raw_params, loss_history, score_history, param_history,
@@ -903,8 +1002,10 @@ def train(config):
             init_phys_np, nan_stopped)
 
 
-def _snapshot(p, S_max, eps_max=0.0):
+def _snapshot(p, S_max, eps_max=0.0, chain_mode=False):
     snap = {'pKa': np.array(p['pKa']), 'phi': float(p['phi']), 'J': float(p['J'])}
+    if chain_mode and 'x' in p:
+        snap['x'] = np.array(p['x'])
     if S_max > 0.0 and 'monomer_entropy' in p:
         snap['monomer_entropy'] = np.array(p['monomer_entropy'])
     if eps_max > 0.0 and 'eps_barrier' in p:

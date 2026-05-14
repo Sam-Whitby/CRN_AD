@@ -22,7 +22,8 @@ def henderson_hasselbalch(pKa, pH, acid_base):
 
 
 def interaction_energy_matrix(charges, correct_mask, phi, J,
-                               monomer_entropy=None, allowed_mask=None):
+                               monomer_entropy=None, allowed_mask=None,
+                               pair_entropy=None):
     """
     Free-energy matrix ΔG_{ij} for all monomer pairs.
 
@@ -35,16 +36,14 @@ def interaction_energy_matrix(charges, correct_mask, phi, J,
         ΔG_{ij} = φ · J · q_i · q_j            (correct species, wrong type)
         ΔG_{ij} = 0                             (wrong species — no interaction)
 
-    allowed_mask is True wherever an interaction is permitted (correct species
-    pair, any type).  It is a superset of correct_mask.
+    phi may be a scalar or an (n, n) matrix.  In chain position mode each
+    pair gets its own selectivity derived from sequence separation; jnp.where
+    broadcasts correctly in both cases.
 
-    If monomer_entropy is provided, an additive conformational-entropy
-    penalty is included:
-
-        ΔG_{ij} += s_i + s_j
-
-    monomer_entropy : jax array, shape () (scalar, shared) or (n,) (per-monomer)
-                      Constrained to [0, S_max].  Ignored when None.
+    monomer_entropy : scalar or (n,) array — per-monomer penalty ΔG += s_i+s_j.
+    pair_entropy    : (n, n) array         — per-pair Jacobson–Stockmayer entropy
+                      from chain position mode.  Added directly: ΔG += pair_entropy.
+    Only one of monomer_entropy / pair_entropy should be non-None.
     """
     qi = charges[:, None]
     qj = charges[None, :]
@@ -57,9 +56,11 @@ def interaction_energy_matrix(charges, correct_mask, phi, J,
 
     if monomer_entropy is not None:
         n  = charges.shape[0]
-        # Broadcast scalar or per-monomer vector to length-n
         s  = jnp.broadcast_to(jnp.atleast_1d(monomer_entropy), (n,))
         dG = dG + s[:, None] + s[None, :]
+
+    if pair_entropy is not None:
+        dG = dG + pair_entropy
 
     return dG
 
@@ -109,7 +110,7 @@ def rate_matrices(dG, beta, k0, eps_barrier=0.0):
 
 def boltzmann_equilibrium_jax(pKa, phi, J, pH, acid_base, correct_mask, beta, n,
                                i_idx, j_idx, monomer_entropy=None, allowed_mask=None,
-                               no_self_bonds=False, n_iter=100):
+                               no_self_bonds=False, n_iter=100, pair_entropy=None):
     """Differentiable Boltzmann equilibrium via unrolled Python loop.
 
     Returns JAX array [free_monomers (n), dimers_triu (n*(n+1)//2)].
@@ -120,12 +121,16 @@ def boltzmann_equilibrium_jax(pKa, phi, J, pH, acid_base, correct_mask, beta, n,
     differentiable sequence of operations (unlike lax.fori_loop/while_loop
     which are NOT reverse-mode differentiable).
 
+    pair_entropy : (n, n) array — chain-position loop-closure entropy (kT).
+                   Passed through to interaction_energy_matrix when not None.
+
     n_iter=100 converges to <1e-10 for all physically reasonable J values.
     """
     charges = henderson_hasselbalch(pKa, float(pH), acid_base)
     dG = interaction_energy_matrix(charges, correct_mask, phi, J,
                                    monomer_entropy=monomer_entropy,
-                                   allowed_mask=allowed_mask)
+                                   allowed_mask=allowed_mask,
+                                   pair_entropy=pair_entropy)
     K = jnp.exp(-float(beta) * dG)
     if no_self_bonds:
         K = K * (1.0 - jnp.eye(n))

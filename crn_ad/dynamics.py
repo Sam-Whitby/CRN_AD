@@ -62,15 +62,20 @@ def crn_ode(state, t,
             pKa, acid_base, phi, J, beta, k0, pH,
             correct_mask, n, i_idx, j_idx,
             monomer_entropy=None, allowed_mask=None, no_self_bonds=False,
-            eps_barrier=0.0):
-    """CRN ODE right-hand side."""
+            eps_barrier=0.0, pair_entropy=None):
+    """CRN ODE right-hand side.
+
+    phi and k0 may each be a scalar or an (n, n) matrix (chain position mode).
+    pair_entropy : (n, n) Jacobson–Stockmayer loop-closure entropy (kT), or None.
+    """
     free       = jnp.maximum(state[:n], 0.0)
     dimer_triu = jnp.maximum(state[n:], 0.0)
 
     charges    = henderson_hasselbalch(pKa, pH, acid_base)
     dG         = interaction_energy_matrix(charges, correct_mask, phi, J,
                                            monomer_entropy=monomer_entropy,
-                                           allowed_mask=allowed_mask)
+                                           allowed_mask=allowed_mask,
+                                           pair_entropy=pair_entropy)
     kf, kb     = rate_matrices(dG, beta, k0, eps_barrier)
     dimer_full = triu_to_full(dimer_triu, n, i_idx, j_idx)
     flux       = kf * jnp.outer(free, free) - kb * dimer_full
@@ -91,14 +96,11 @@ def simulate_segment(state, pH, duration,
                      correct_mask, n, i_idx, j_idx,
                      n_points=60, monomer_entropy=None, allowed_mask=None,
                      beta_ramp_duration=0.0, no_self_bonds=False,
-                     eps_barrier=0.0):
+                     eps_barrier=0.0, pair_entropy=None):
     """Simulate one pH segment.
 
-    beta_ramp_duration: if > 0, beta ramps linearly from 0 → beta over the
-    first beta_ramp_duration time units, then stays at beta.  Used for the
-    equilibration segment to avoid a sharp-switch ODE transient.
-    eps_barrier: intrinsic activation barrier ε_‡ ≥ 0 (kT).  Slows all rates
-    by exp(−β·ε_‡) without changing equilibrium constants.  See rate_matrices().
+    phi / k0 may be scalar or (n, n) matrix (chain position mode).
+    pair_entropy : (n, n) loop-closure entropy matrix, or None.
     """
     t0    = 0.0
     t1    = float(duration)
@@ -112,13 +114,13 @@ def simulate_segment(state, pH, duration,
             return crn_ode(s, t, pKa, acid_base, phi, J, beta_t, k0, float(pH),
                            correct_mask, n, i_idx, j_idx,
                            monomer_entropy, allowed_mask, no_self_bonds,
-                           eps_barrier=eps_barrier)
+                           eps_barrier=eps_barrier, pair_entropy=pair_entropy)
     else:
         def vf(t, s, _args):
             return crn_ode(s, t, pKa, acid_base, phi, J, float(beta), k0, float(pH),
                            correct_mask, n, i_idx, j_idx,
                            monomer_entropy, allowed_mask, no_self_bonds,
-                           eps_barrier=eps_barrier)
+                           eps_barrier=eps_barrier, pair_entropy=pair_entropy)
 
     sol = diffrax.diffeqsolve(
         diffrax.ODETerm(vf),
@@ -141,7 +143,7 @@ def simulate_schedule(initial_state, pH_schedule, duration_per_seg,
                       correct_mask, n, i_idx, j_idx,
                       n_points=60, monomer_entropy=None, allowed_mask=None,
                       beta_ramp_duration=0.0, no_self_bonds=False,
-                      eps_barrier=0.0):
+                      eps_barrier=0.0, pair_entropy=None):
     """Python-loop simulation — use for visualisation only (not inside JIT)."""
     state, traj_list = initial_state, []
     for pH in pH_schedule:
@@ -150,7 +152,7 @@ def simulate_schedule(initial_state, pH_schedule, duration_per_seg,
             pKa, acid_base, phi, J, beta, k0,
             correct_mask, n, i_idx, j_idx, n_points,
             monomer_entropy, allowed_mask, beta_ramp_duration, no_self_bonds,
-            eps_barrier=eps_barrier)
+            eps_barrier=eps_barrier, pair_entropy=pair_entropy)
         traj_list.append(traj)
     return state, traj_list
 
@@ -167,19 +169,13 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                            beta_ramp_duration=0.0,
                            no_self_bonds=False,
                            return_traj=False,
-                           eps_barrier=0.0):
+                           eps_barrier=0.0,
+                           pair_entropy=None):
     """
     Scan-based simulation — O(1) JAX graph via lax.scan + vmap.
 
-    smooth_width       : if > 0, pH ramps smoothly at each segment start.
-    ph_initial         : pH before this schedule (for smooth ramp on first seg).
-    allowed_mask       : if not None, pairs outside this mask have ΔG=0.
-    beta_ramp_duration : if > 0, beta ramps linearly 0→beta over this many
-                         time units at the start of the segment.
-    return_traj        : if True, also return stacked segment trajectories as a
-                         (n_segs, n_points, state_size) array alongside the
-                         final state.  When False (default), returns only the
-                         final state (cheaper: uses SaveAt(t1=True)).
+    phi / k0 may each be a scalar or (n, n) matrix (chain position mode).
+    pair_entropy : (n, n) loop-closure entropy matrix, or None.
     """
     t0    = 0.0
     t1    = float(duration_per_seg)
@@ -199,7 +195,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                 return crn_ode(s, t, pKa, acid_base, phi, J, beta_t, k0, pH,
                                correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds,
-                               eps_barrier=eps_barrier)
+                               eps_barrier=eps_barrier, pair_entropy=pair_entropy)
         else:
             def vf(t, s, ph_args):
                 _pH_prev, _pH_target = ph_args
@@ -208,7 +204,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                 return crn_ode(s, t, pKa, acid_base, phi, J, float(beta), k0, pH,
                                correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds,
-                               eps_barrier=eps_barrier)
+                               eps_barrier=eps_barrier, pair_entropy=pair_entropy)
 
         if return_traj:
             def segment_fn(carry, pH_target):
@@ -221,7 +217,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                     stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
                     max_steps=4096, adjoint=diffrax.RecursiveCheckpointAdjoint(),
                 )
-                traj  = sol.ys                        # (n_points, state_size)
+                traj  = sol.ys
                 final = jnp.maximum(traj[-1], 0.0)
                 return (final, pH_target), traj
         else:
@@ -247,13 +243,13 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                 return crn_ode(s, t, pKa, acid_base, phi, J, beta_t, k0, pH,
                                correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds,
-                               eps_barrier=eps_barrier)
+                               eps_barrier=eps_barrier, pair_entropy=pair_entropy)
         else:
             def vf(t, s, pH):
                 return crn_ode(s, t, pKa, acid_base, phi, J, float(beta), k0, pH,
                                correct_mask, n, i_idx, j_idx,
                                monomer_entropy, allowed_mask, no_self_bonds,
-                               eps_barrier=eps_barrier)
+                               eps_barrier=eps_barrier, pair_entropy=pair_entropy)
 
         if return_traj:
             def segment_fn(state, pH):
@@ -265,7 +261,7 @@ def simulate_schedule_scan(initial_state, pH_schedule_array,
                     stepsize_controller=diffrax.PIDController(rtol=1e-4, atol=1e-6),
                     max_steps=4096, adjoint=diffrax.RecursiveCheckpointAdjoint(),
                 )
-                traj  = sol.ys                       # (n_points, state_size)
+                traj  = sol.ys
                 final = jnp.maximum(traj[-1], 0.0)
                 return final, traj
         else:
